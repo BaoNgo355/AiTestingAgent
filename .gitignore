@@ -22,6 +22,7 @@ htmlcov/
 venv/
 
 # Tài liệu dự án & script xuất tài liệu (không đưa lên GitHub repo theo yêu cầu)
+docs/
 AGENTS.md
 SRS.md
 SRS.docx
