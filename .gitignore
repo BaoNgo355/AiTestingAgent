@@ -1,0 +1,33 @@
+# Environment & secrets
+.env
+
+# aitest runtime artifacts
+.aitest_backup/
+.aitest_logs/
+aitest.yaml
+
+# Python / build / test cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+coverage.json
+.mutmut-cache
+htmlcov/
+.venv/
+venv/
+
+# Tài liệu dự án & script xuất tài liệu (không đưa lên GitHub repo theo yêu cầu)
+AGENTS.md
+SRS.md
+SRS.docx
+KE_HOACH_DU_AN.md
+KE_HOACH_DU_AN.docx
+~$*.docx
+scripts/export_srs_docx.py
+scripts/export_plan_docx.py
+scripts/update_toc.ps1
