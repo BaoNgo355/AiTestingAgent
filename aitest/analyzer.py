@@ -97,6 +97,8 @@ AssertionInfo.model_rebuild()
 class TestFunctionInfo(BaseModel):
     """Thông tin một hàm kiểm thử `test_*` trong file test."""
 
+    __test__ = False
+
     name: str
     lineno: int
     end_lineno: int | None = None
@@ -122,6 +124,8 @@ class HelperOrFixtureInfo(BaseModel):
 
 class TestFileAnalysis(BaseModel):
     """Kết quả phân tích AST của một file unit test."""
+
+    __test__ = False
 
     file_path: str
     imports: list[str] = Field(default_factory=list)
