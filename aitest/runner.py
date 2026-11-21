@@ -15,6 +15,7 @@ from pathlib import Path
 from aitest.analyzer import analyze_test_file
 from aitest.config import AitestConfig
 from aitest.mutation import run_mutation_testing
+from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.schemas import ErrorCategory, MutationResult, RunResult
 from aitest.utils import resolve_test_file_path, validate_single_python_file
 
@@ -286,8 +287,10 @@ def run_tests(
     enable_coverage: bool | None = None,
     enable_mutation: bool | None = None,
     timeout_sec: int | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> RunResult:
     """Thực thi bộ unit test cho `<target_file>`, thu thập chỉ số khách quan, coverage và mutation (FR-03)."""
+    rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
     root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
     resolved_test = (
@@ -357,32 +360,38 @@ def run_tests(
     exit_code = -1
 
     proc: subprocess.Popen[str] | None = None
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(root_dir),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+    step_label = (
+        f"Chạy pytest + line coverage cho '{resolved_test.name}'"
+        if use_cov
+        else f"Chạy pytest cho '{resolved_test.name}'"
+    )
+    with rep.step(step_label):
         try:
-            stdout_str, stderr_str = proc.communicate(timeout=float(effective_timeout))
-            exit_code = proc.returncode
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_process_tree(proc.pid)
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(root_dir),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
             try:
-                out_rem, err_rem = proc.communicate(timeout=3.0)
-                stdout_str = out_rem or ""
-                stderr_str = err_rem or ""
-            except Exception:
-                pass
-            exit_code = 124
-    finally:
-        duration_ms = max(0, int((time.perf_counter_ns() - start_ns) / 1_000_000))
+                stdout_str, stderr_str = proc.communicate(timeout=float(effective_timeout))
+                exit_code = proc.returncode
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_process_tree(proc.pid)
+                try:
+                    out_rem, err_rem = proc.communicate(timeout=3.0)
+                    stdout_str = out_rem or ""
+                    stderr_str = err_rem or ""
+                except Exception:
+                    pass
+                exit_code = 124
+        finally:
+            duration_ms = max(0, int((time.perf_counter_ns() - start_ns) / 1_000_000))
 
     passed, failed, skipped, errors = (
         (0, 0, 0, 0)
@@ -451,6 +460,7 @@ def run_tests(
             test_file=resolved_test,
             config=config,
             project_root=root_dir,
+            reporter=rep,
         )
 
     return RunResult(

@@ -16,6 +16,7 @@ from aitest.evaluator import evaluate_test_suite
 from aitest.fixer import fix_test_file
 from aitest.generator import SafeAppendError, generate_tests, safe_merge_and_append
 from aitest.llm.client import OllamaClient
+from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.runner import run_tests
 from aitest.schemas import AgentIterationLog, EvalReport, RunResult
 from aitest.utils import (
@@ -82,6 +83,7 @@ def run_agent_loop(
     llm_client: OllamaClient | None = None,
     run_id: str | None = None,
     project_root: Path | str | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> AgentRunResult:
     """Thực thi vòng lặp Agent tự động theo đúng quy trình FR-06 & thứ tự ưu tiên điều kiện dừng §6.3.
 
@@ -92,6 +94,7 @@ def run_agent_loop(
     4. Đạt số vòng tối đa (`max_iters`).
     5. Không còn cải thiện sau `early_stop_patience` vòng liên tiếp (early stop) hoặc đạt 100% mutation & coverage.
     """
+    rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
     root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
     resolved_test = (
@@ -143,6 +146,9 @@ def run_agent_loop(
     try:
         # Bước 2: Nếu chưa có file test -> gọi bước gen (FR-02) để sinh bộ test ban đầu
         if not resolved_test.is_file():
+            rep.info(
+                f"\n[bold cyan]━━━ Pha Khởi tạo: Sinh bộ Unit Test ban đầu cho '{validated_target.name}' ━━━[/bold cyan]"
+            )
             calls_before = client.total_calls
             tokens_before = client.total_tokens
             gen_res = generate_tests(
@@ -153,6 +159,7 @@ def run_agent_loop(
                 llm_client=client,
                 run_id=effective_run_id,
                 project_root=root_dir,
+                reporter=rep,
             )
             history.append(
                 AgentIterationLog(
@@ -176,6 +183,11 @@ def run_agent_loop(
         # Bước 3: Vòng lặp Agent (iteration = 1 .. eff_max_iters)
         for iteration in range(1, eff_max_iters + 1):
             iterations_completed = iteration
+            rep.on_agent_iteration_start(
+                iteration=iteration,
+                max_iters=eff_max_iters,
+                baseline=baseline,
+            )
 
             # 3a. Chạy run + coverage (+ mutation nếu test pass)
             curr_run = run_tests(
@@ -185,6 +197,7 @@ def run_agent_loop(
                 project_root=root_dir,
                 enable_coverage=work_config.coverage.enabled,
                 enable_mutation=work_config.mutation.enabled,
+                reporter=rep,
             )
             last_run_result = curr_run
 
@@ -193,6 +206,9 @@ def run_agent_loop(
                 # Ưu tiên dừng (1): Lỗi không thể sửa bằng test
                 if not curr_run.error_category.is_fixable_by_llm:
                     stop_reason = f"unfixable_error:{curr_run.error_category.value}"
+                    rep.warn(
+                        f"  [red]✗ Dừng ngay do gặp lỗi không được phép sửa bằng test:[/red] {stop_reason}"
+                    )
                     history.append(
                         AgentIterationLog(
                             iteration=iteration,
@@ -211,6 +227,7 @@ def run_agent_loop(
                 b_reason = _budget_exceeded_reason()
                 if b_reason:
                     stop_reason = b_reason
+                    rep.warn(f"  [yellow]⚠ Dừng trước khi fix do vượt ngân sách:[/yellow] {stop_reason}")
                     history.append(
                         AgentIterationLog(
                             iteration=iteration,
@@ -242,6 +259,7 @@ def run_agent_loop(
                     llm_client=client,
                     run_id=effective_run_id,
                     project_root=root_dir,
+                    reporter=rep,
                 )
                 guard_rejections += sum(1 for r in fix_res.records if not r.accepted)
                 curr_run = fix_res.final_run_result
@@ -278,12 +296,24 @@ def run_agent_loop(
                 llm_client=client,
                 run_id=effective_run_id,
                 project_root=root_dir,
+                reporter=rep,
             )
             last_eval_report = eval_report
 
             curr_mut_pct = eval_report.objective_metrics.mutation_score_pct
             curr_cov_pct = eval_report.objective_metrics.line_coverage_pct
             curr_weighted = eval_report.weighted_score
+
+            rep.on_agent_iteration_summary(
+                iteration=iteration,
+                max_iters=eff_max_iters,
+                cov_pct=curr_cov_pct,
+                mut_pct=curr_mut_pct,
+                weighted_score=curr_weighted,
+                threshold=eff_threshold,
+                total_tokens=client.total_tokens,
+                elapsed_sec=_elapsed_sec(),
+            )
 
             # Kiểm tra mức cải thiện để tính early_stop_patience
             improved = False
@@ -391,7 +421,18 @@ def run_agent_loop(
 
             calls_before_imp = client.total_calls
             tokens_before_imp = client.total_tokens
-            imp_resp = client.chat(system_prompt=sys_imp, user_prompt=usr_imp)
+            with rep.step(
+                f"[Improve vòng {iteration}] Đang gọi Ollama ({work_config.model}) viết thêm test diệt {len(survived_list)} survived mutants",
+                done_message=f"[Improve vòng {iteration}] Ollama đã sinh xong các hàm test bổ sung",
+            ):
+                imp_resp = client.chat(system_prompt=sys_imp, user_prompt=usr_imp)
+            rep.on_llm_call_end(
+                task_name=f"improve#{iteration}",
+                model=imp_resp.model_actual or work_config.model,
+                prompt_tokens=imp_resp.prompt_tokens,
+                completion_tokens=imp_resp.completion_tokens,
+                latency_ms=imp_resp.latency_ms,
+            )
 
             try:
                 append_res = safe_merge_and_append(
@@ -404,6 +445,7 @@ def run_agent_loop(
                 )
             except SafeAppendError as exc:
                 guard_rejections += 1
+                rep.warn(f"  [red]✗ Safe Append từ chối đoạn test improve:[/red] {exc}")
                 if bak_improve:
                     restore_backup(bak_improve, resolved_test)
                 history.append(
@@ -420,6 +462,9 @@ def run_agent_loop(
                 )
                 continue
 
+            rep.info(
+                f"  [green]✓[/green] Đã ghép {len(append_res.added_tests)} hàm test mới qua Safe Append, đang kiểm chứng lại..."
+            )
             # Chạy thử file test sau khi append để đảm bảo không làm hỏng bộ test hoặc làm giảm mutation score
             verify_run = run_tests(
                 target_file=validated_target,
@@ -428,6 +473,7 @@ def run_agent_loop(
                 project_root=root_dir,
                 enable_coverage=work_config.coverage.enabled,
                 enable_mutation=work_config.mutation.enabled,
+                reporter=rep,
             )
             verify_mut_pct = (
                 verify_run.mutation.mutation_score_pct
@@ -450,6 +496,7 @@ def run_agent_loop(
                     if not verify_run.all_tests_passed
                     else f"Mutation score bị giảm ({verify_mut_pct}% < {curr_mut_pct}%)"
                 )
+                rep.warn(f"  [yellow]⚠ Đã rollback pha improve:[/yellow] {rb_reason}")
                 history.append(
                     AgentIterationLog(
                         iteration=iteration,
@@ -486,6 +533,7 @@ def run_agent_loop(
                 test_file=resolved_test,
                 project_root=root_dir,
                 enable_mutation=False,
+                reporter=rep,
             )
             last_eval_report = evaluate_test_suite(
                 target_file=validated_target,
@@ -495,6 +543,7 @@ def run_agent_loop(
                 llm_client=client,
                 run_id=effective_run_id,
                 project_root=root_dir,
+                reporter=rep,
             )
 
         # Ghi lý do dừng cuối cùng vào phần tử cuối của history[] (§6.3)

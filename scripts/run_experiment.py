@@ -22,6 +22,7 @@ from rich.table import Table
 
 from aitest.agent import AgentRunResult, run_agent_loop
 from aitest.config import AitestConfig, load_config
+from aitest.progress import RichProgressReporter
 from aitest.utils import atomic_write_text, utc_now_iso
 
 DEFAULT_EXAMPLE_FILES: tuple[str, ...] = (
@@ -203,6 +204,8 @@ def run_experiment(
     output_json: Path | str = ".aitest_logs/experiment_report.json",
     output_md: Path | str = ".aitest_logs/experiment_report.md",
     project_root: Path | str | None = None,
+    quiet: bool = False,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Thực thi kịch bản đối sánh thực nghiệm Baseline A và Agent B trên tập file mẫu."""
     root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
@@ -210,6 +213,7 @@ def run_experiment(
     cfg: AitestConfig = load_config(cli_overrides=cli_overrides)
     cfg.agent.max_iters = max_iters
     cfg.eval.threshold_pass = threshold_pass
+    reporter = RichProgressReporter(console=console, quiet=quiet, verbose=verbose)
 
     baseline_results: list[AgentRunResult] = []
     agent_results: list[AgentRunResult] = []
@@ -221,9 +225,10 @@ def run_experiment(
             target_path = root_dir / file_rel
             stem = target_path.stem
             for run_idx in range(1, runs_per_file + 1):
-                console.print(
-                    f"[bold cyan]>>> File: {file_rel} | Run {run_idx}/{runs_per_file}[/bold cyan]"
-                )
+                if not quiet:
+                    console.print(
+                        f"\n[bold cyan]>>> File: {file_rel} | Run {run_idx}/{runs_per_file}[/bold cyan]"
+                    )
 
                 # 1. Nhánh Baseline A (--baseline)
                 test_file_a = work_sandbox / f"baseline_run_{run_idx}" / f"test_{stem}.py"
@@ -235,6 +240,7 @@ def run_experiment(
                     threshold_pass=threshold_pass,
                     baseline=True,
                     project_root=root_dir,
+                    reporter=reporter,
                 )
                 baseline_results.append(res_a)
 
@@ -248,6 +254,7 @@ def run_experiment(
                     threshold_pass=threshold_pass,
                     baseline=False,
                     project_root=root_dir,
+                    reporter=reporter,
                 )
                 agent_results.append(res_b)
 
@@ -399,6 +406,17 @@ def parse_args() -> argparse.Namespace:
         default=".aitest_logs/experiment_report.md",
         help="Đường dẫn file xuất bảng đối sánh Markdown.",
     )
+    parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Tắt hiển thị tiến độ trực quan trung gian.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Hiển thị thêm chi tiết token, latency và từng mutant.",
+    )
     return parser.parse_args()
 
 
@@ -412,4 +430,6 @@ if __name__ == "__main__":
         model_override=args.model,
         output_json=args.output_json,
         output_md=args.output_md,
+        quiet=args.quiet,
+        verbose=args.verbose,
     )

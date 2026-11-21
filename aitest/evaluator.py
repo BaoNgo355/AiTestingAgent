@@ -8,6 +8,7 @@ from aitest import __version__
 from aitest.config import AitestConfig
 from aitest.context import build_eval_prompts
 from aitest.llm.client import OllamaClient
+from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.runner import run_tests
 from aitest.schemas import EvalReport, Meta, RunResult, build_eval_report
 from aitest.utils import (
@@ -37,6 +38,7 @@ def evaluate_test_suite(
     run_id: str | None = None,
     enable_mutation: bool | None = None,
     project_root: Path | str | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> EvalReport:
     """Thực thi đánh giá 2 tầng và trả về `EvalReport` chuẩn hóa 100% qua Pydantic (FR-05).
 
@@ -46,6 +48,7 @@ def evaluate_test_suite(
     3. Áp dụng trần `correctness <= mutation_score_10 + correctness_cap_offset` khi `mutation_available == True`.
     4. Chuẩn hóa `weights_effective`, tính `weighted_score` từ điểm gốc chưa làm tròn và xác định `report_comparable`.
     """
+    rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
     root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
     resolved_test = (
@@ -70,6 +73,7 @@ def evaluate_test_suite(
             test_file=resolved_test,
             project_root=root_dir,
             enable_mutation=enable_mutation,
+            reporter=rep,
         )
 
     source_code = validated_target.read_text(encoding="utf-8")
@@ -90,11 +94,22 @@ def evaluate_test_suite(
     owns_client = llm_client is None
     client = llm_client or OllamaClient(config)
     try:
-        llm_assessment, llm_resp = client.generate_structured_assessment(
-            system_prompt=sys_prompt,
-            user_prompt=usr_prompt,
-            run_id=effective_run_id,
-            log_dir=root_dir / config.output.log_dir,
+        with rep.step(
+            f"Đang gọi Ollama ({config.model}) chấm điểm Rubric 2 tầng cho '{resolved_test.name}'",
+            done_message=f"Ollama ({config.model}) đã hoàn tất chấm điểm Rubric",
+        ):
+            llm_assessment, llm_resp = client.generate_structured_assessment(
+                system_prompt=sys_prompt,
+                user_prompt=usr_prompt,
+                run_id=effective_run_id,
+                log_dir=root_dir / config.output.log_dir,
+            )
+        rep.on_llm_call_end(
+            task_name="eval",
+            model=llm_resp.model_actual or config.model,
+            prompt_tokens=llm_resp.prompt_tokens,
+            completion_tokens=llm_resp.completion_tokens,
+            latency_ms=llm_resp.latency_ms,
         )
     finally:
         if owns_client:

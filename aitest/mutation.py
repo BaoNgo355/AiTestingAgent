@@ -12,9 +12,10 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from aitest.config import AitestConfig
+from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.schemas import MutationResult, SurvivedMutant
 
 
@@ -330,8 +331,10 @@ def _run_ast_mutation_engine(
     test_file: Path,
     config: AitestConfig,
     project_root: Path,
+    reporter: ProgressReporter | None = None,
 ) -> MutationResult:
     """Thực thi Built-in AST Mutation Engine trong môi trường sandbox cô lập (an toàn 100% cho file nguồn)."""
+    rep = reporter or NullProgressReporter()
     start_ns = time.perf_counter_ns()
     source_code = target_file.read_text(encoding="utf-8")
     specs = collect_ast_mutants(source_code)
@@ -344,6 +347,13 @@ def _run_ast_mutation_engine(
 
     if not specs:
         elapsed_ms = max(0, int((time.perf_counter_ns() - start_ns) / 1_000_000))
+        rep.on_mutation_end(
+            killed=0,
+            survived=0,
+            excluded=0,
+            score_pct=None,
+            duration_ms=elapsed_ms,
+        )
         return MutationResult(
             mutation_score_pct=None,
             mutation_killed=0,
@@ -358,6 +368,8 @@ def _run_ast_mutation_engine(
             duration_ms=elapsed_ms,
         )
 
+    total_specs = len(specs)
+    rep.on_mutation_start(total_mutants=total_specs, target_file=display_target_file)
     sandbox_root = Path(tempfile.mkdtemp(prefix="aitest_mut_sandbox_"))
     try:
         target_abs = target_file.resolve()
@@ -415,7 +427,7 @@ def _run_ast_mutation_engine(
         total_timeout_sec = float(config.mutation.timeout_sec)
         per_mutant_timeout = float(config.mutation.per_mutant_timeout_sec)
 
-        for spec in specs:
+        for idx, spec in enumerate(specs, start=1):
             elapsed_sec = (time.perf_counter_ns() - start_ns) / 1_000_000_000
             if elapsed_sec >= total_timeout_sec:
                 break
@@ -423,6 +435,15 @@ def _run_ast_mutation_engine(
             mutated_code = render_mutant_source(source_code, spec)
             if mutated_code is None:
                 excluded += 1
+                rep.on_mutant_tested(
+                    index=idx,
+                    total=total_specs,
+                    lineno=spec.lineno,
+                    mutation=spec.mutation,
+                    status="excluded",
+                    killed_so_far=killed,
+                    survived_so_far=survived,
+                )
                 continue
 
             sandbox_target.write_text(mutated_code, encoding="utf-8")
@@ -434,11 +455,13 @@ def _run_ast_mutation_engine(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            m_status: Literal["killed", "survived", "timeout"] = "killed"
             try:
                 proc.communicate(timeout=per_mutant_timeout)
                 rc = proc.returncode
                 if rc == 0:
                     survived += 1
+                    m_status = "survived"
                     survived_mutants.append(
                         SurvivedMutant(
                             file=display_target_file,
@@ -448,6 +471,7 @@ def _run_ast_mutation_engine(
                     )
                 else:
                     killed += 1
+                    m_status = "killed"
             except subprocess.TimeoutExpired:
                 _kill_process_tree(proc.pid)
                 try:
@@ -456,12 +480,30 @@ def _run_ast_mutation_engine(
                     pass
                 timeouts += 1
                 killed += 1
+                m_status = "timeout"
+
+            rep.on_mutant_tested(
+                index=idx,
+                total=total_specs,
+                lineno=spec.lineno,
+                mutation=spec.mutation,
+                status=m_status,
+                killed_so_far=killed,
+                survived_so_far=survived,
+            )
     finally:
         shutil.rmtree(str(sandbox_root), ignore_errors=True)
 
     elapsed_ms = max(0, int((time.perf_counter_ns() - start_ns) / 1_000_000))
     valid_total = killed + survived
     if valid_total < config.mutation.min_valid_mutants:
+        rep.on_mutation_end(
+            killed=killed,
+            survived=survived,
+            excluded=excluded,
+            score_pct=None,
+            duration_ms=elapsed_ms,
+        )
         return MutationResult(
             mutation_score_pct=None,
             mutation_killed=killed,
@@ -479,6 +521,13 @@ def _run_ast_mutation_engine(
         )
 
     score_pct = round((killed / valid_total) * 100.0, 2)
+    rep.on_mutation_end(
+        killed=killed,
+        survived=survived,
+        excluded=excluded,
+        score_pct=score_pct,
+        duration_ms=elapsed_ms,
+    )
     return MutationResult(
         mutation_score_pct=score_pct,
         mutation_killed=killed,
@@ -500,6 +549,7 @@ def run_mutation_testing(
     test_file: Path | str,
     config: AitestConfig,
     project_root: Path | str | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> MutationResult:
     """Điểm vào chính của Mutation Testing theo kiến trúc Dual Backend (FR-07)."""
     if not config.mutation.enabled:
@@ -520,14 +570,13 @@ def run_mutation_testing(
 
     backend = _resolve_backend(config.mutation.tool)
     try:
-        # Built-in AST Engine là engine chuẩn đa nền tảng, đảm bảo định dạng survived_mutants
-        # đồng nhất (file, line, mutation) trên cả Windows và POSIX.
         res = _run_ast_mutation_engine(
             target_file=t_path,
             display_target_file=rel_display,
             test_file=tst_path,
             config=config,
             project_root=root_path,
+            reporter=reporter,
         )
         return res
     except Exception as exc:

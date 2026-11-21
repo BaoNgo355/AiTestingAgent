@@ -16,6 +16,7 @@ from aitest.analyzer import (
 from aitest.config import AitestConfig
 from aitest.context import build_gen_prompts
 from aitest.llm.client import OllamaClient
+from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.utils import (
     atomic_write_text,
     backup_file,
@@ -261,8 +262,10 @@ def generate_tests(
     llm_client: OllamaClient | None = None,
     run_id: str | None = None,
     project_root: Path | str | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> SafeAppendResult:
     """Thực thi quy trình `aitest gen <file.py>` (FR-02 & §12.1)."""
+    rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
     root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
     resolved_test = (
@@ -274,41 +277,60 @@ def generate_tests(
         resolved_test = root_dir / resolved_test
 
     effective_run_id = run_id or generate_run_id()
-    source_code = validated_target.read_text(encoding="utf-8")
-    source_analysis = analyze_source_file(validated_target, project_root=root_dir)
+    with rep.step(
+        f"Phân tích AST file nguồn '{validated_target.name}'",
+        done_message=f"Đã phân tích AST '{validated_target.name}'",
+    ):
+        source_code = validated_target.read_text(encoding="utf-8")
+        source_analysis = analyze_source_file(validated_target, project_root=root_dir)
 
-    existing_test_names: list[str] = []
-    if resolved_test.is_file() and mode == "append" and not no_llm_dedup:
-        try:
-            old_test_analysis = analyze_test_code(
-                resolved_test.read_text(encoding="utf-8"),
-                file_path=resolved_test,
-            )
-            existing_test_names = old_test_analysis.test_names
-        except SyntaxError:
-            existing_test_names = []
+        existing_test_names: list[str] = []
+        if resolved_test.is_file() and mode == "append" and not no_llm_dedup:
+            try:
+                old_test_analysis = analyze_test_code(
+                    resolved_test.read_text(encoding="utf-8"),
+                    file_path=resolved_test,
+                )
+                existing_test_names = old_test_analysis.test_names
+            except SyntaxError:
+                existing_test_names = []
 
-    sys_prompt, usr_prompt = build_gen_prompts(
-        target_file=validated_target,
-        source_code=source_code,
-        source_analysis=source_analysis,
-        existing_test_names=existing_test_names,
-        project_root=root_dir,
-    )
+        sys_prompt, usr_prompt = build_gen_prompts(
+            target_file=validated_target,
+            source_code=source_code,
+            source_analysis=source_analysis,
+            existing_test_names=existing_test_names,
+            project_root=root_dir,
+        )
 
     owns_client = llm_client is None
     client = llm_client or OllamaClient(config)
     try:
-        llm_resp = client.chat(system_prompt=sys_prompt, user_prompt=usr_prompt)
+        with rep.step(
+            f"Đang gọi Ollama ({config.model}) sinh unit test cho '{validated_target.name}'",
+            done_message=f"Ollama ({config.model}) đã sinh xong mã test",
+        ):
+            llm_resp = client.chat(system_prompt=sys_prompt, user_prompt=usr_prompt)
+        rep.on_llm_call_end(
+            task_name="gen",
+            model=llm_resp.model_actual or config.model,
+            prompt_tokens=llm_resp.prompt_tokens,
+            completion_tokens=llm_resp.completion_tokens,
+            latency_ms=llm_resp.latency_ms,
+        )
     finally:
         if owns_client:
             client.close()
 
-    return safe_merge_and_append(
-        test_file=resolved_test,
-        new_code=llm_resp.content,
-        mode=mode,
-        backup_dir=root_dir / config.output.backup_dir,
-        log_dir=root_dir / config.output.log_dir,
-        run_id=effective_run_id,
-    )
+    with rep.step(
+        f"Kiểm tra AST và ghép an toàn (Safe Append, mode={mode}) vào '{resolved_test.name}'",
+        done_message=f"Đã lưu file test '{resolved_test.name}' (mode={mode})",
+    ):
+        return safe_merge_and_append(
+            test_file=resolved_test,
+            new_code=llm_resp.content,
+            mode=mode,
+            backup_dir=root_dir / config.output.backup_dir,
+            log_dir=root_dir / config.output.log_dir,
+            run_id=effective_run_id,
+        )

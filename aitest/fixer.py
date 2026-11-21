@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from aitest.config import AitestConfig
 from aitest.context import build_fix_prompts
 from aitest.llm.client import OllamaClient
+from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.quality_guard import check_quality_guard
 from aitest.runner import run_tests
 from aitest.schemas import AssertionDiffEntry, ErrorCategory, GuardResult, RunResult
@@ -78,6 +79,7 @@ def fix_test_file(
     llm_client: OllamaClient | None = None,
     run_id: str | None = None,
     project_root: Path | str | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> FixResult:
     """Thực thi quy trình sửa lỗi test có kiểm soát (FR-04 & §12.3).
 
@@ -87,6 +89,7 @@ def fix_test_file(
     - Luôn backup trước mỗi lần ghi.
     - Kiểm tra Quality Guard (AST Assertion Diff) và mutation score; vi phạm -> rollback ngay từ backup.
     """
+    rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
     root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
     resolved_test = (
@@ -111,6 +114,7 @@ def fix_test_file(
         test_file=resolved_test,
         project_root=root_dir,
         enable_mutation=False,
+        reporter=rep,
     )
 
     if curr_run.all_tests_passed:
@@ -177,7 +181,18 @@ def fix_test_file(
                 project_root=root_dir,
             )
 
-            llm_resp = client.chat(system_prompt=sys_prompt, user_prompt=usr_prompt)
+            with rep.step(
+                f"[Fix {iter_idx}/{effective_max_iters}] Đang gọi Ollama ({config.model}) sửa lỗi {curr_run.error_category.value}",
+                done_message=f"[Fix {iter_idx}/{effective_max_iters}] Ollama đã trả về bản sửa cho '{resolved_test.name}'",
+            ):
+                llm_resp = client.chat(system_prompt=sys_prompt, user_prompt=usr_prompt)
+            rep.on_llm_call_end(
+                task_name=f"fix#{iter_idx}",
+                model=llm_resp.model_actual or config.model,
+                prompt_tokens=llm_resp.prompt_tokens,
+                completion_tokens=llm_resp.completion_tokens,
+                latency_ms=llm_resp.latency_ms,
+            )
             candidate_code = sanitize_code_block(llm_resp.content)
 
             guard_res = check_quality_guard(
@@ -209,6 +224,9 @@ def fix_test_file(
 
             if not guard_res.passed:
                 reason_msg = "; ".join(guard_res.reasons)
+                rep.warn(
+                    f"  [red]✗ [Fix {iter_idx}/{effective_max_iters}] Bị chặn bởi Quality Guard:[/red] {reason_msg}"
+                )
                 save_raw_log(
                     root_dir / config.output.log_dir,
                     effective_run_id,
@@ -234,6 +252,9 @@ def fix_test_file(
                 continue
 
             # Quality Guard passed -> Ghi file bằng Atomic Write và chạy lại pytest (+ mutation nếu pass)
+            rep.info(
+                f"  [green]✓[/green] [Fix {iter_idx}/{effective_max_iters}] Vượt qua Quality Guard, đang chạy lại kiểm thử..."
+            )
             atomic_write_text(resolved_test, candidate_code, verify_python_ast=True)
             new_run = run_tests(
                 target_file=validated_target,
@@ -241,6 +262,7 @@ def fix_test_file(
                 test_file=resolved_test,
                 project_root=root_dir,
                 enable_mutation=config.mutation.enabled,
+                reporter=rep,
             )
 
             # Kiểm tra hậu nghiệm mutation score (FR-04 bước 8): nếu giảm so với baseline -> rollback ngay

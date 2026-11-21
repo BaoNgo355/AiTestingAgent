@@ -26,6 +26,7 @@ from aitest.output import (
     print_run_result,
     print_safety_notice,
 )
+from aitest.progress import RichProgressReporter
 from aitest.runner import run_tests
 from aitest.utils import atomic_write_text
 
@@ -170,6 +171,17 @@ def gen_cmd(
         help="Không gửi danh sách tên hàm test hiện có vào prompt LLM (Safe Append vẫn dedup bằng AST).",
     ),
     model: Optional[str] = typer.Option(None, "--model", help="Ghi đè tên model Ollama."),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet",
+        "-q",
+        help="Tắt toàn bộ hiển thị tiến độ trực quan trung gian.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        help="Hiển thị thêm chi tiết token và latency của từng lần gọi LLM.",
+    ),
 ) -> None:
     """Sinh unit test cho một file Python (.py) đơn lẻ với cơ chế Safe Append (FR-02)."""
     norm_mode = mode.strip().lower()
@@ -179,11 +191,13 @@ def gen_cmd(
 
     try:
         cfg = load_config(cli_overrides={"model": model} if model else None)
+        reporter = RichProgressReporter(console=err_console, quiet=quiet, verbose=verbose)
         res = generate_tests(
             target_file=file,
             config=cfg,
             mode=lit_mode,
             no_llm_dedup=no_llm_dedup,
+            reporter=reporter,
         )
         print_gen_result(console, res, target_file=file)
     except (ValueError, FileNotFoundError, SyntaxError, SafeAppendError, OllamaError) as exc:
@@ -209,17 +223,31 @@ def run_cmd(
         "-t",
         help="Timeout thực thi pytest (giây, mặc định 120s).",
     ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet",
+        "-q",
+        help="Tắt toàn bộ hiển thị tiến độ trực quan trung gian.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        help="Hiển thị chi tiết trạng thái của từng mutant trong lúc chạy.",
+    ),
 ) -> None:
     """Chạy unit test, thu thập line coverage và mutation score khách quan (FR-03)."""
     try:
         cfg = load_config()
-        print_safety_notice(console)
+        if not quiet:
+            print_safety_notice(console)
+        reporter = RichProgressReporter(console=err_console, quiet=quiet, verbose=verbose)
         res = run_tests(
             target_file=file,
             config=cfg,
             enable_coverage=cov,
             enable_mutation=mutation,
             timeout_sec=timeout,
+            reporter=reporter,
         )
         print_run_result(console, res)
         if not res.all_tests_passed:
@@ -242,17 +270,31 @@ def fix_cmd(
         help="Chỉ kiểm tra Quality Guard và hiển thị unified diff, không ghi đè file test.",
     ),
     model: Optional[str] = typer.Option(None, "--model", help="Ghi đè tên model Ollama."),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet",
+        "-q",
+        help="Tắt toàn bộ hiển thị tiến độ trực quan trung gian.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        help="Hiển thị thêm chi tiết token, latency và từng mutant.",
+    ),
 ) -> None:
     """Sửa lỗi file test tự động có kiểm soát với Quality Guard và AST Assertion Diff (FR-04)."""
     try:
         overrides = {"model": model} if model else None
         cfg = load_config(cli_overrides=overrides)
-        print_safety_notice(console)
+        if not quiet:
+            print_safety_notice(console)
+        reporter = RichProgressReporter(console=err_console, quiet=quiet, verbose=verbose)
         res = fix_test_file(
             target_file=file,
             config=cfg,
             max_iters=max_iters,
             dry_run=dry_run,
+            reporter=reporter,
         )
         print_fix_result(console, res)
         if not res.fixed and not res.dry_run:
@@ -281,17 +323,31 @@ def eval_cmd(
         help="Tắt Mutation Testing (báo cáo sẽ được đánh dấu report_comparable = false).",
     ),
     model: Optional[str] = typer.Option(None, "--model", help="Ghi đè tên model Ollama."),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet",
+        "-q",
+        help="Tắt toàn bộ hiển thị tiến độ trên stderr (chỉ xuất JSON ra stdout).",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        help="Hiển thị thêm chi tiết token, latency và từng mutant trên stderr.",
+    ),
 ) -> None:
     """Đánh giá chất lượng unit test theo mô hình 2 tầng và xuất báo cáo JSON chuẩn Pydantic (FR-05)."""
     if format.strip().lower() != "json":
         _fail_with_error("MVP chỉ hỗ trợ định dạng xuất '--format json'.")
     try:
         cfg = load_config(cli_overrides={"model": model} if model else None)
-        print_safety_notice(err_console)
+        if not quiet:
+            print_safety_notice(err_console)
+        reporter = RichProgressReporter(console=err_console, quiet=quiet, verbose=verbose)
         report = evaluate_test_suite(
             target_file=file,
             config=cfg,
             enable_mutation=(False if no_mutation else cfg.mutation.enabled),
+            reporter=reporter,
         )
         emit_eval_report_json(report, output_file=output, print_to_stdout=True)
     except (ValueError, FileNotFoundError, SyntaxError, OllamaError) as exc:
@@ -338,11 +394,24 @@ def agent_cmd(
         help="Ghi báo cáo EvalReport JSON cuối cùng ra file.",
     ),
     model: Optional[str] = typer.Option(None, "--model", help="Ghi đè tên model Ollama."),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet",
+        "-q",
+        help="Tắt toàn bộ hiển thị tiến độ trên stderr (chỉ xuất JSON ra stdout).",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        help="Hiển thị thêm chi tiết token, latency và từng mutant trên stderr.",
+    ),
 ) -> None:
     """Thực thi vòng lặp Agent tự động: gen -> run -> fix -> mutation -> eval -> improve (FR-06)."""
     try:
         cfg = load_config(cli_overrides={"model": model} if model else None)
-        print_safety_notice(err_console)
+        if not quiet:
+            print_safety_notice(err_console)
+        reporter = RichProgressReporter(console=err_console, quiet=quiet, verbose=verbose)
         agent_res = run_agent_loop(
             target_file=file,
             config=cfg,
@@ -352,8 +421,10 @@ def agent_cmd(
             max_total_tokens=max_total_tokens,
             max_runtime_sec=max_runtime_sec,
             baseline=baseline,
+            reporter=reporter,
         )
-        print_agent_summary(err_console, agent_res)
+        if not quiet:
+            print_agent_summary(err_console, agent_res)
         emit_eval_report_json(agent_res.final_report, output_file=output, print_to_stdout=True)
     except (ValueError, FileNotFoundError, SyntaxError, SafeAppendError, OllamaError) as exc:
         _fail_with_error(str(exc), code=1)
