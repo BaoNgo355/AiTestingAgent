@@ -81,6 +81,13 @@ Classified Error Category: {{ error_category }}
 ### Reference Source Code (READ-ONLY — represents true behavior)
 {{ source_code }}
 
+{% if ast_summary_lines is defined and ast_summary_lines %}
+### Extracted AST Targets & Exact Exception Conditions
+{% for line in ast_summary_lines %}
+{{ line }}
+{% endfor %}
+{% endif %}
+
 ### Current Failing Test File (`{{ test_file }}`)
 {{ current_test_code }}
 

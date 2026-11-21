@@ -45,6 +45,7 @@ class BankAccount:
     assert "ValueError" in fn_div.raised_exceptions
     assert len(fn_div.parameters) == 2
     assert fn_div.parameters[1].default == "1.0"
+    assert any("b == 0" in rc and "ValueError" in rc for rc in fn_div.raise_conditions)
 
     fn_async = analysis.functions[1]
     assert fn_async.name == "fetch_value"

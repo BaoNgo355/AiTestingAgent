@@ -75,6 +75,7 @@ def build_fix_prompts(
         module_name=src_analysis.module_name,
         error_category=error_category.value,
         source_code=source_code,
+        ast_summary_lines=src_analysis.target_summary_lines(),
         current_test_code=current_test_code,
         pytest_output=trimmed_output,
         existing_test_names=existing_names,

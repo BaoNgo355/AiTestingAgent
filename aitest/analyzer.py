@@ -31,6 +31,7 @@ class FunctionInfo(BaseModel):
     decorators: list[str] = Field(default_factory=list)
     docstring: str | None = None
     raised_exceptions: list[str] = Field(default_factory=list)
+    raise_conditions: list[str] = Field(default_factory=list)
     signature_str: str = ""
 
 
@@ -57,7 +58,7 @@ class SourceAnalysis(BaseModel):
     total_lines: int = 0
 
     def target_summary_lines(self) -> list[str]:
-        """Tạo danh sách mô tả ngắn gọn các đối tượng cần test để đưa vào prompt."""
+        """Tạo danh sách mô tả ngắn gọn các đối tượng cần test (kèm điều kiện raise chính xác) để đưa vào prompt."""
         lines: list[str] = []
         for fn in self.functions:
             prefix = "async def" if fn.is_async else "def"
@@ -67,6 +68,10 @@ class SourceAnalysis(BaseModel):
             if fn.docstring:
                 first_doc = fn.docstring.strip().splitlines()[0]
                 lines.append(f"    Doc: {first_doc}")
+            if fn.raise_conditions:
+                lines.append("    Exact exception conditions (ONLY raise under these conditions):")
+                for rc in fn.raise_conditions:
+                    lines.append(f"      * {rc}")
         for cls in self.classes:
             bases_str = f"({', '.join(cls.bases)})" if cls.bases else ""
             lines.append(f"- Class `class {cls.name}{bases_str}` (line {cls.lineno})")
@@ -75,6 +80,9 @@ class SourceAnalysis(BaseModel):
                 ret = f" -> {m.return_annotation}" if m.return_annotation else ""
                 raises = f" [raises: {', '.join(m.raised_exceptions)}]" if m.raised_exceptions else ""
                 lines.append(f"    * Method `{prefix} {m.name}{m.signature_str}{ret}` (line {m.lineno}){raises}")
+                if m.raise_conditions:
+                    for rc in m.raise_conditions:
+                        lines.append(f"        - Raises: {rc}")
         return lines
 
 
@@ -221,21 +229,55 @@ def _format_signature(params: list[ParameterInfo]) -> str:
     return f"({', '.join(parts)})"
 
 
-def _extract_raised_exceptions(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+def _extract_raised_exceptions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[list[str], list[str]]:
+    """Trích xuất danh sách tên ngoại lệ và điều kiện `if` chính xác kích hoạt từng lệnh `raise`."""
     exceptions: list[str] = []
-    for node in ast.walk(func_node):
-        if isinstance(node, ast.Raise) and node.exc is not None:
-            if isinstance(node, ast.Raise):
-                exc_node = node.exc
-                if isinstance(exc_node, ast.Call):
-                    name = _unparse_safe(exc_node.func)
-                elif isinstance(exc_node, ast.Name):
-                    name = exc_node.id
-                else:
-                    name = _unparse_safe(exc_node)
-                if name and name not in exceptions:
-                    exceptions.append(name)
-    return exceptions
+    conditions: list[str] = []
+
+    def _describe_raise(exc_node: ast.expr) -> tuple[str | None, str | None]:
+        if isinstance(exc_node, ast.Call):
+            name = _unparse_safe(exc_node.func)
+            msg = None
+            if exc_node.args and isinstance(exc_node.args[0], ast.Constant) and isinstance(exc_node.args[0].value, str):
+                msg = exc_node.args[0].value
+            return name, msg
+        if isinstance(exc_node, ast.Name):
+            return exc_node.id, None
+        return _unparse_safe(exc_node), None
+
+    def _walk_stmts(stmts: list[ast.stmt], active_conds: list[str]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+                name, msg = _describe_raise(stmt.exc)
+                if name:
+                    if name not in exceptions:
+                        exceptions.append(name)
+                    cond_text = " and ".join(active_conds) if active_conds else "unconditional"
+                    msg_part = f'("{msg}")' if msg else ""
+                    entry = f"`{name}{msg_part}` when `{cond_text}`"
+                    if entry not in conditions:
+                        conditions.append(entry)
+            elif isinstance(stmt, ast.If):
+                test_str = _unparse_safe(stmt.test) or "condition"
+                _walk_stmts(stmt.body, [*active_conds, test_str])
+                if stmt.orelse:
+                    _walk_stmts(stmt.orelse, [*active_conds, f"not ({test_str})"])
+            else:
+                for child_field in ("body", "orelse", "finalbody", "handlers"):
+                    sub = getattr(stmt, child_field, None)
+                    if isinstance(sub, list):
+                        for item in sub:
+                            if isinstance(item, ast.ExceptHandler):
+                                _walk_stmts(item.body, active_conds)
+                            elif isinstance(item, ast.stmt):
+                                _walk_stmts([item], active_conds)
+
+    _walk_stmts(func_node.body, [])
+    return exceptions, conditions
 
 
 def _extract_function_info(
@@ -246,6 +288,7 @@ def _extract_function_info(
 ) -> FunctionInfo:
     params = _extract_parameters(node.args)
     decorators = [d for d in (_unparse_safe(dec) for dec in node.decorator_list) if d]
+    raised_excs, raise_conds = _extract_raised_exceptions(node)
     return FunctionInfo(
         name=node.name,
         lineno=node.lineno,
@@ -257,7 +300,8 @@ def _extract_function_info(
         return_annotation=_unparse_safe(node.returns),
         decorators=decorators,
         docstring=ast.get_docstring(node),
-        raised_exceptions=_extract_raised_exceptions(node),
+        raised_exceptions=raised_excs,
+        raise_conditions=raise_conds,
         signature_str=_format_signature(params),
     )
 
