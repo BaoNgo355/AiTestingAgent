@@ -187,6 +187,56 @@ def save_raw_log(
     return file_path
 
 
+def discover_project_root(start_path: Path | str | None = None) -> Path:
+    """Tìm thư mục gốc của dự án (nơi chứa `aitest.yaml`, `pyproject.toml` hoặc `.git`).
+
+    Giúp người dùng dù đứng trong thư mục con (như `examples/`) vẫn tự động dùng chung
+    `tests/`, `.aitest_logs/`, `.aitest_backup/` ở thư mục gốc dự án.
+    """
+    curr = Path(start_path).resolve() if start_path else Path.cwd().resolve()
+    if curr.is_file():
+        curr = curr.parent
+
+    for directory in (curr, *curr.parents):
+        if (
+            (directory / "aitest.yaml").is_file()
+            or (directory / "pyproject.toml").is_file()
+            or (directory / ".git").exists()
+        ):
+            return directory
+    return curr
+
+
+def ensure_pytest_imported(code: str) -> str:
+    """Đảm bảo `import pytest` luôn có mặt ở đầu file nếu mã test có sử dụng biến `pytest`."""
+    if not code.strip():
+        return code
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+
+    has_pytest_import = False
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            if any(alias.name == "pytest" and alias.asname is None for alias in node.names):
+                has_pytest_import = True
+                break
+        elif isinstance(node, ast.ImportFrom) and node.module == "pytest":
+            has_pytest_import = True
+            break
+
+    if has_pytest_import:
+        return code
+
+    uses_pytest_name = any(
+        isinstance(sub, ast.Name) and sub.id == "pytest" for sub in ast.walk(tree)
+    )
+    if uses_pytest_name:
+        return f"import pytest\n{code}"
+    return code
+
+
 def validate_single_python_file(target_path: Path | str) -> Path:
     """Kiểm tra ràng buộc đầu vào: chỉ một file .py tồn tại và parse được bằng ast.parse (FR-02, AC-02)."""
     raw_str = str(target_path).strip()
@@ -194,6 +244,13 @@ def validate_single_python_file(target_path: Path | str) -> Path:
         raise ValueError(SINGLE_PY_FILE_ERROR_MSG)
 
     path = Path(raw_str)
+    if not path.exists() and not path.is_absolute():
+        # Nếu người dùng đứng ở thư mục con (ví dụ examples/) nhưng gõ `examples/calculator.py`
+        proj_root = discover_project_root()
+        candidate = proj_root / path
+        if candidate.exists():
+            path = candidate
+
     if path.exists() and path.is_dir():
         raise ValueError(SINGLE_PY_FILE_ERROR_MSG)
     if path.suffix.lower() != ".py":

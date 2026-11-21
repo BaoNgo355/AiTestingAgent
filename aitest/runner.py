@@ -17,11 +17,14 @@ from aitest.config import AitestConfig
 from aitest.mutation import run_mutation_testing
 from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.schemas import ErrorCategory, MutationResult, RunResult
-from aitest.utils import resolve_test_file_path, validate_single_python_file
+from aitest.utils import (
+    discover_project_root,
+    resolve_test_file_path,
+    validate_single_python_file,
+)
 
 _SUMMARY_COUNT_RE = re.compile(
-    r"(\d+)\s+(passed|failed|skipped|error|errors|xfailed|xpassed)",
-    re.IGNORECASE,
+    r"\b(\d+)[ \t]+(passed|failed|skipped|error|errors|xfailed|xpassed)\b"
 )
 
 
@@ -75,7 +78,7 @@ def parse_pytest_summary(output: str, exit_code: int) -> tuple[int, int, int, in
     # Fallback: đếm từ ký tự rút gọn `.FEs` của pytest -q nếu không có dòng chữ summary
     if passed == 0 and failed == 0 and skipped == 0 and errors == 0 and exit_code in (0, 1):
         for line in lines:
-            m = re.match(r"^([.FEskxX]+)\s+\[\s*\d+%\]$", line)
+            m = re.match(r"^(?:\S+\s+)?([.FEskxX]+)\s+\[\s*\d+%\]$", line)
             if m:
                 chars = m.group(1)
                 passed += chars.count(".")
@@ -292,7 +295,11 @@ def run_tests(
     """Thực thi bộ unit test cho `<target_file>`, thu thập chỉ số khách quan, coverage và mutation (FR-03)."""
     rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
-    root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
+    root_dir = (
+        Path(project_root).resolve()
+        if project_root
+        else discover_project_root(validated_target)
+    )
     resolved_test = (
         Path(test_file)
         if test_file is not None
@@ -337,6 +344,8 @@ def run_tests(
         "-m",
         "pytest",
         str(resolved_test),
+        "-o",
+        "addopts=",
         "--tb=short",
         "-q",
     ]

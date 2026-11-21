@@ -20,6 +20,8 @@ from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.utils import (
     atomic_write_text,
     backup_file,
+    discover_project_root,
+    ensure_pytest_imported,
     generate_run_id,
     resolve_test_file_path,
     sanitize_code_block,
@@ -98,7 +100,7 @@ def safe_merge_and_append(
     """
     effective_run_id = run_id or generate_run_id()
     dest_path = Path(test_file)
-    cleaned_new = sanitize_code_block(new_code)
+    cleaned_new = ensure_pytest_imported(sanitize_code_block(new_code))
 
     if not cleaned_new.strip():
         save_raw_log(log_dir, effective_run_id, "empty_test_code", new_code)
@@ -267,7 +269,11 @@ def generate_tests(
     """Thực thi quy trình `aitest gen <file.py>` (FR-02 & §12.1)."""
     rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
-    root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
+    root_dir = (
+        Path(project_root).resolve()
+        if project_root
+        else discover_project_root(validated_target)
+    )
     resolved_test = (
         Path(test_file)
         if test_file is not None

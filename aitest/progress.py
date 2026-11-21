@@ -241,7 +241,7 @@ class RichProgressReporter(ProgressReporter):
             return
         total_tok = prompt_tokens + completion_tokens
         self._print(
-            f"  [dim]↳ LLM [{task_name}] ({model}): "
+            f"  [dim]↳ LLM \\[{task_name}] ({model}): "
             f"{prompt_tokens} prompt + {completion_tokens} completion = {total_tok} tokens "
             f"({latency_ms / 1000.0:.2f}s)[/dim]"
         )
@@ -302,12 +302,12 @@ class RichProgressReporter(ProgressReporter):
 
         if status == "survived":
             self._print(
-                f"  [yellow]⚠ Mutant survived[/yellow] [{index}/{total}] dòng {lineno}: "
+                f"  [yellow]⚠ Mutant survived[/yellow] \\[{index}/{total}] dòng {lineno}: "
                 f"[bold]{mutation}[/bold]"
             )
         elif self.verbose:
             self._print(
-                f"  [dim]✓ Mutant {status} [{index}/{total}] dòng {lineno}: {mutation}[/dim]"
+                f"  [dim]✓ Mutant {status} \\[{index}/{total}] dòng {lineno}: {mutation}[/dim]"
             )
 
     def on_mutation_end(

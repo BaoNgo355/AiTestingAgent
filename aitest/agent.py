@@ -22,6 +22,7 @@ from aitest.schemas import AgentIterationLog, EvalReport, RunResult
 from aitest.utils import (
     atomic_write_text,
     backup_file,
+    discover_project_root,
     generate_run_id,
     resolve_test_file_path,
     restore_backup,
@@ -96,7 +97,11 @@ def run_agent_loop(
     """
     rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
-    root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
+    root_dir = (
+        Path(project_root).resolve()
+        if project_root
+        else discover_project_root(validated_target)
+    )
     resolved_test = (
         Path(test_file)
         if test_file is not None

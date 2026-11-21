@@ -13,6 +13,7 @@ from aitest.runner import run_tests
 from aitest.schemas import EvalReport, Meta, RunResult, build_eval_report
 from aitest.utils import (
     compute_config_hash,
+    discover_project_root,
     generate_run_id,
     resolve_test_file_path,
     utc_now_iso,
@@ -50,7 +51,11 @@ def evaluate_test_suite(
     """
     rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
-    root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
+    root_dir = (
+        Path(project_root).resolve()
+        if project_root
+        else discover_project_root(validated_target)
+    )
     resolved_test = (
         Path(test_file)
         if test_file is not None

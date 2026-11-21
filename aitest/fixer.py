@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import difflib
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from aitest.schemas import AssertionDiffEntry, ErrorCategory, GuardResult, RunRe
 from aitest.utils import (
     atomic_write_text,
     backup_file,
+    discover_project_root,
+    ensure_pytest_imported,
     generate_run_id,
     resolve_test_file_path,
     restore_backup,
@@ -67,6 +70,17 @@ def _make_unified_diff(old_text: str, new_text: str, filename: str) -> str:
     return "".join(diff_lines)
 
 
+def _is_same_ast(code_a: str, code_b: str) -> bool:
+    if code_a.strip() == code_b.strip():
+        return True
+    try:
+        tree_a = ast.parse(code_a)
+        tree_b = ast.parse(code_b)
+        return ast.dump(tree_a, include_attributes=False) == ast.dump(tree_b, include_attributes=False)
+    except SyntaxError:
+        return False
+
+
 def fix_test_file(
     target_file: Path | str,
     config: AitestConfig,
@@ -91,7 +105,11 @@ def fix_test_file(
     """
     rep = reporter or NullProgressReporter()
     validated_target = validate_single_python_file(target_file)
-    root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
+    root_dir = (
+        Path(project_root).resolve()
+        if project_root
+        else discover_project_root(validated_target)
+    )
     resolved_test = (
         Path(test_file)
         if test_file is not None
@@ -193,7 +211,31 @@ def fix_test_file(
                 completion_tokens=llm_resp.completion_tokens,
                 latency_ms=llm_resp.latency_ms,
             )
-            candidate_code = sanitize_code_block(llm_resp.content)
+            candidate_code = ensure_pytest_imported(sanitize_code_block(llm_resp.content))
+
+            if not dry_run and _is_same_ast(current_test_code, candidate_code):
+                no_change_msg = (
+                    "LLM returned the exact same test file without making any changes! "
+                    "You MUST modify the failing assertions or exception arguments shown in the Pytest Traceback."
+                )
+                rep.warn(
+                    f"  [yellow]⚠ \\[Fix {iter_idx}/{effective_max_iters}] LLM trả về file test chưa thay đổi, yêu cầu sửa lại...[/yellow]"
+                )
+                records.append(
+                    FixIterationRecord(
+                        iteration=iter_idx,
+                        error_category_before=curr_run.error_category,
+                        guard_result=None,
+                        accepted=False,
+                        all_tests_passed_after=False,
+                        backup_path=str(bak_path) if bak_path else None,
+                        reason="LLM trả về mã test giống hệt bản đang lỗi (không có thay đổi)",
+                        diff_preview="",
+                    )
+                )
+                extra_feedback = no_change_msg
+                stop_reason = "max_iters_reached"
+                continue
 
             guard_res = check_quality_guard(
                 current_test_code,

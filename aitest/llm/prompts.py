@@ -48,13 +48,14 @@ Python module import path: `{{ module_name }}` (import target symbols using `fro
 {% endif %}
 
 ### Requirements
-1. Write comprehensive `pytest` unit tests covering:
-   - Normal / happy paths with exact expected values (`assert actual == expected`).
+1. Always include `import pytest` at the very top of the file.
+2. Write comprehensive `pytest` unit tests covering:
+   - Normal / happy paths with exact expected values (`assert actual == expected`). Double-check all arithmetic calculations against the source code logic.
    - Boundary and edge conditions (0, negative numbers, empty strings/collections, exact threshold boundaries such as `<` vs `<=` and `>` vs `>=`).
-   - Error and exception paths using `with pytest.raises(SpecificException):`.
-2. Ensure every test function is deterministic, isolated, and named `test_< descriptive_name >`.
-3. Never use trivial tautologies (`assert True`, `assert x is not None` when a concrete value can be asserted) or `@pytest.mark.skip` / `xfail`.
-4. Return ONLY raw Python code ready to be parsed by `ast.parse()`.
+   - Error and exception paths using `with pytest.raises(SpecificException):` where the arguments passed strictly match the exact `if ...: raise SpecificException(...)` branch in the source code (for example, distinguish `TypeError` for wrong type vs `ValueError` for invalid value).
+3. Ensure every test function is deterministic, isolated, and named `test_<descriptive_name>`.
+4. Never use trivial tautologies (`assert True`, `assert x is not None` when a concrete value can be asserted) or `@pytest.mark.skip` / `xfail`.
+5. Return ONLY raw Python code ready to be parsed by `ast.parse()`.
 """
 )
 
@@ -86,13 +87,16 @@ Classified Error Category: {{ error_category }}
 ### Pytest Output & Traceback
 {{ pytest_output }}
 
-### Strict Quality Guard Rules (Violations will be automatically rejected!)
-1. Keep ALL existing test functions ({{ existing_test_names | join(', ') }}). Do NOT delete or rename existing `test_*` functions.
-2. Keep at least the same total number of `assert` statements and `with pytest.raises(...)` blocks.
-3. Do NOT add `@pytest.mark.skip`, `@pytest.mark.skipif`, `@pytest.mark.xfail`, or call `pytest.skip()` / `pytest.xfail()`.
-4. Do NOT weaken any `assert x == expected` into `assert x is not None`, `assert isinstance(...)`, `assert True`, `assert len(x) >= 0`, or relax `==` into `!=`, `>=`, `<=`.
-5. Only fix syntax errors, wrong function call arguments, or miscalculated expected constant values in `==` so that they match the true logic of the source code.
-6. Return the COMPLETE fixed test file as raw Python code without markdown fences.
+### How to Fix the Failing Tests (MUST make actual code changes!)
+1. Ensure `import pytest` and all necessary module imports are at the top of the file.
+2. For any `AssertionError: assert <actual> == <expected>` in the traceback: update the expected value in `assert ... == <actual>` (or fix the input arguments) so it matches the true output of the reference source code.
+3. For any failing `with pytest.raises(ExpectedException):` block (either `DID NOT RAISE` or raised a different exception):
+   - Do NOT delete the `with pytest.raises(ExpectedException):` block!
+   - Instead, change the arguments passed to the function inside `with pytest.raises(ExpectedException):` so that it actually triggers `ExpectedException` according to the `raise` conditions in the Reference Source Code (e.g., pass a wrong type like `1.5` or `"bad"` to trigger `TypeError`, or pass all-zero weights `[0, 0, 0]` / negative values `-1` to trigger `ValueError`).
+4. Keep ALL existing test functions ({{ existing_test_names | join(', ') }}). Do NOT delete or rename existing `test_*` functions.
+5. Keep at least the same total number of `assert` statements and `with pytest.raises(...)` blocks.
+6. Do NOT add `@pytest.mark.skip`, `skipif`, `xfail`, or weaken `==` into `is not None`, `assert True`, `!=`, `>=`, `<=`.
+7. Return the COMPLETE fixed test file as raw Python code without markdown fences.
 """
 )
 
