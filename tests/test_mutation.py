@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from aitest.config import AitestConfig
-from aitest.mutation import run_mutation_testing
+from aitest.mutation import collect_ast_mutants, run_mutation_testing
 from aitest.utils import compute_file_hash
 
 
@@ -99,3 +99,62 @@ def test_mutation_no_valid_mutants_returns_null_score_ac22(tmp_path: Path) -> No
     assert res.mutation_available is False
     assert res.mutation_status == "no_valid_mutants"
     assert res.mutation_score_pct is None
+
+
+def test_mutation_augassign_chained_compare_coverage_skip_and_worker_timeout_recovery(
+    tmp_path: Path,
+) -> None:
+    """Kiểm tra P1.5:
+    - Sinh mutant cho `AugAssign` (`+=`) và chained `Compare` (`'a' <= ch <= 'z'`).
+    - Lọc nhanh bằng `executed_lines` đánh dấu đúng mutant trên dòng chưa phủ là `survived`.
+    - Persistent worker xử lý đúng mutant gây vòng lặp vô hạn (`timeout`) và vẫn tiếp tục test các mutant sau.
+    """
+    sample_src = (
+        "def process(ch: str, n: int) -> int:\n"
+        "    total = 0\n"
+        "    if 'a' <= ch <= 'z':\n"
+        "        total += n\n"
+        "    return total\n"
+    )
+    specs = collect_ast_mutants(sample_src)
+    mutations = [s.mutation for s in specs]
+    assert "+= -> -=" in mutations
+    assert "<= -> <" in mutations
+
+    # Kiểm tra timeout recovery trong Persistent Worker:
+    # Khi `i += 1` bị mutate thành `i -= 1`, vòng `while i < limit:` thành lặp vô hạn -> timeout,
+    # nhưng mutant ở câu `return total` phía sau vẫn chạy đúng.
+    loop_src = tmp_path / "loop_mod.py"
+    loop_src.write_text(
+        "def count_up(limit: int) -> int:\n"
+        "    i = 0\n"
+        "    total = 0\n"
+        "    while i < limit:\n"
+        "        total += i\n"
+        "        i += 1\n"
+        "    if limit < 0:\n"
+        "        return -1\n"
+        "    return total\n",
+        encoding="utf-8",
+    )
+    loop_test = tmp_path / "test_loop_mod.py"
+    loop_test.write_text(
+        "from loop_mod import count_up\n\n"
+        "def test_count_up():\n"
+        "    assert count_up(3) == 3\n",
+        encoding="utf-8",
+    )
+    cfg = AitestConfig()
+    cfg.mutation.per_mutant_timeout_sec = 0.8
+    # Dòng 8 (`return -1`) chưa được phủ -> truyền executed_lines bỏ qua dòng 8
+    res = run_mutation_testing(
+        target_file=loop_src,
+        test_file=loop_test,
+        config=cfg,
+        project_root=tmp_path,
+        executed_lines={1, 2, 3, 4, 5, 6, 7, 9},
+    )
+    assert res.mutation_available is True
+    assert res.mutation_timeout >= 1
+    assert res.mutation_killed is not None and res.mutation_killed >= 1
+    assert any(m.line == 8 for m in res.survived_mutants)

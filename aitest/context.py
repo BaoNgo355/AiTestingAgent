@@ -11,6 +11,7 @@ from aitest.llm.prompts import (
     render_fix_prompt,
     render_gen_prompt,
     render_improve_prompt,
+    render_targeted_fix_prompt,
 )
 from aitest.schemas import ErrorCategory, ObjectiveMetrics, RunResult, SurvivedMutant
 
@@ -82,6 +83,40 @@ def build_fix_prompts(
     )
 
 
+def build_targeted_fix_prompts(
+    *,
+    target_file: Path | str,
+    test_file: Path | str,
+    source_code: str,
+    header_context: str,
+    failing_tests_code: str,
+    failing_test_names: list[str],
+    pytest_output: str,
+    error_category: ErrorCategory = ErrorCategory.TEST_FAILURE,
+    project_root: Path | str | None = None,
+) -> tuple[str, str]:
+    """Tạo cặp `(system_prompt, user_prompt)` cho tác vụ sửa khoanh vùng riêng các hàm test bị fail."""
+    src_analysis = analyze_source_code(
+        source_code, file_path=target_file, project_root=project_root
+    )
+    trimmed_output = pytest_output.strip()
+    if len(trimmed_output) > 6000:
+        trimmed_output = trimmed_output[:3000] + "\n...[truncated]...\n" + trimmed_output[-3000:]
+
+    return render_targeted_fix_prompt(
+        target_file=str(target_file),
+        test_file=str(test_file),
+        module_name=src_analysis.module_name,
+        error_category=error_category.value,
+        source_code=source_code,
+        ast_summary_lines=src_analysis.target_summary_lines(),
+        header_context=header_context.strip(),
+        failing_tests_code=failing_tests_code.strip(),
+        failing_test_names=failing_test_names,
+        pytest_output=trimmed_output,
+    )
+
+
 def build_improve_prompts(
     *,
     target_file: Path | str,
@@ -89,6 +124,8 @@ def build_improve_prompts(
     existing_test_names: list[str],
     survived_mutants: list[SurvivedMutant],
     missing_lines: list[int] | None = None,
+    existing_fixtures: list[str] | None = None,
+    existing_helpers: list[str] | None = None,
     project_root: Path | str | None = None,
 ) -> tuple[str, str]:
     """Tạo cặp `(system_prompt, user_prompt)` cho pha `improve` trong Agent Loop."""
@@ -116,6 +153,8 @@ def build_improve_prompts(
         existing_test_names=existing_test_names,
         survived_mutants_details=mutant_details,
         missing_lines=sorted(set(missing_lines or [])),
+        existing_fixtures=existing_fixtures or [],
+        existing_helpers=existing_helpers or [],
     )
 
 

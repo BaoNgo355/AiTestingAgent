@@ -40,14 +40,14 @@ def utc_now_iso() -> str:
 
 
 def compute_config_hash(config: BaseModel | dict[str, Any]) -> str:
-    """Tính mã băm SHA-256 chuẩn hóa của cấu hình (tuyệt đối loại bỏ khóa bí mật)."""
+    """Tính mã băm SHA-256 chuẩn hóa của cấu hình."""
     if isinstance(config, BaseModel):
         if hasattr(config, "safe_dump"):
             data = config.safe_dump()
         else:
-            data = config.model_dump(exclude={"ollama_api_key"})
+            data = config.model_dump()
     else:
-        data = {k: v for k, v in config.items() if k != "ollama_api_key"}
+        data = dict(config)
 
     canonical = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -267,7 +267,102 @@ def validate_single_python_file(target_path: Path | str) -> Path:
     return path
 
 
-def resolve_test_file_path(target_file: Path | str, tests_dir: Path | str = "tests") -> Path:
-    """Trả về đường dẫn file test tương ứng: `<tests_dir>/test_<stem>.py`."""
+_STDLIB_AND_TEST_MODULES: frozenset[str] = frozenset(
+    {
+        "__future__",
+        "pytest",
+        "unittest",
+        "typing",
+        "pathlib",
+        "os",
+        "sys",
+        "re",
+        "math",
+        "json",
+        "datetime",
+        "collections",
+        "dataclasses",
+        "itertools",
+        "functools",
+        "time",
+        "tempfile",
+        "io",
+        "enum",
+        "decimal",
+        "fractions",
+        "random",
+        "string",
+        "copy",
+    }
+)
+
+
+def _extract_non_stdlib_imports(test_file_path: Path) -> set[str]:
+    """Trích xuất tập tên module không thuộc thư viện chuẩn/pytest được import trong file test."""
+    try:
+        tree = ast.parse(test_file_path.read_text(encoding="utf-8"), filename=str(test_file_path))
+    except (SyntaxError, OSError):
+        return set()
+
+    imported: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top not in _STDLIB_AND_TEST_MODULES:
+                    imported.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top = node.module.split(".")[0]
+            if top not in _STDLIB_AND_TEST_MODULES:
+                imported.add(node.module)
+                for alias in node.names:
+                    if alias.name != "*":
+                        imported.add(f"{node.module}.{alias.name}")
+    return imported
+
+
+def resolve_test_file_path(
+    target_file: Path | str,
+    tests_dir: Path | str = "tests",
+    project_root: Path | str | None = None,
+) -> Path:
+    """Trả về đường dẫn file test tương ứng: `<tests_dir>/test_<stem>.py`.
+
+    Collision Guard: Nếu `<tests_dir>/test_<stem>.py` đã tồn tại nhưng import một module
+    hoàn toàn khác với file nguồn mục tiêu (ví dụ `tests/test_analyzer.py` của hệ thống `aitest`
+    khi mục tiêu là `examples/analyzer.py`), tự động tách sang `<tests_dir>/test_<parent>_<stem>.py`.
+    """
     target = Path(target_file)
-    return Path(tests_dir) / f"test_{target.stem}.py"
+    default_rel = Path(tests_dir) / f"test_{target.stem}.py"
+
+    root = Path(project_root).resolve() if project_root else discover_project_root(target)
+    check_path = (
+        default_rel if default_rel.is_absolute() else (root / default_rel)
+    )
+
+    if check_path.is_file() and target.exists():
+        target_abs = target.resolve()
+        try:
+            rel_parts = list(target_abs.relative_to(root).with_suffix("").parts)
+        except ValueError:
+            rel_parts = []
+
+        if len(rel_parts) >= 2:
+            full_mod = ".".join(rel_parts)
+            parent_mod = ".".join(rel_parts[:-1])
+            stem = target.stem
+            imported = _extract_non_stdlib_imports(check_path)
+            if imported:
+                matches_target = any(
+                    imp == full_mod
+                    or imp.startswith(f"{full_mod}.")
+                    or imp == stem
+                    or imp.startswith(f"{stem}.")
+                    or imp == f"{parent_mod}.{stem}"
+                    for imp in imported
+                )
+                if not matches_target:
+                    safe_prefix = "_".join(rel_parts[:-1])
+                    return Path(tests_dir) / f"test_{safe_prefix}_{stem}.py"
+
+    return default_rel

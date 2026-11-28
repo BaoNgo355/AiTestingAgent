@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import time
 from pathlib import Path
@@ -13,12 +14,12 @@ from aitest.analyzer import analyze_test_code
 from aitest.config import AitestConfig
 from aitest.context import build_improve_prompts
 from aitest.evaluator import evaluate_test_suite
-from aitest.fixer import fix_test_file
+from aitest.fixer import extract_failing_test_names, fix_test_file
 from aitest.generator import SafeAppendError, generate_tests, safe_merge_and_append
-from aitest.llm.client import OllamaClient
+from aitest.llm.client import AntigravityClient
 from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.runner import run_tests
-from aitest.schemas import AgentIterationLog, EvalReport, RunResult
+from aitest.schemas import AgentIterationLog, ErrorCategory, EvalReport, RunResult
 from aitest.utils import (
     atomic_write_text,
     backup_file,
@@ -26,6 +27,7 @@ from aitest.utils import (
     generate_run_id,
     resolve_test_file_path,
     restore_backup,
+    sanitize_code_block,
     validate_single_python_file,
 )
 
@@ -46,6 +48,56 @@ class AgentRunResult(BaseModel):
     history_file: str | None = None
     history: list[AgentIterationLog] = Field(default_factory=list)
     final_report: EvalReport
+
+
+def _filter_failing_new_tests(
+    raw_new_code: str,
+    failing_final_names: set[str],
+    renamed_tests: list[tuple[str, str]],
+) -> str | None:
+    """Lọc bỏ các hàm test mới bị fail khỏi đoạn code improve để giữ lại phần hàm test pass."""
+    cleaned = sanitize_code_block(raw_new_code)
+    try:
+        tree = ast.parse(cleaned)
+    except SyntaxError:
+        return None
+
+    final_to_orig = {new_n: old_n for old_n, new_n in renamed_tests}
+    drop_orig_names = {final_to_orig.get(fn, fn) for fn in failing_final_names}
+
+    kept_body: list[ast.stmt] = []
+    remaining_tests = 0
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            if node.name in drop_orig_names or node.name in failing_final_names:
+                continue
+            remaining_tests += 1
+            kept_body.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            kept_cls_body: list[ast.stmt] = []
+            cls_tests = 0
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test_"):
+                    qname = f"{node.name}.{item.name}"
+                    if qname in drop_orig_names or item.name in failing_final_names or qname in failing_final_names:
+                        continue
+                    cls_tests += 1
+                    remaining_tests += 1
+                    kept_cls_body.append(item)
+                else:
+                    kept_cls_body.append(item)
+            if cls_tests > 0:
+                node.body = kept_cls_body
+                kept_body.append(node)
+        else:
+            kept_body.append(node)
+
+    if remaining_tests == 0:
+        return None
+
+    tree.body = kept_body
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
 
 
 def _snapshot_metrics(run_res: RunResult | None, eval_rep: EvalReport | None = None) -> dict[str, Any]:
@@ -81,7 +133,7 @@ def run_agent_loop(
     max_total_tokens: int | None = None,
     max_runtime_sec: int | None = None,
     baseline: bool = False,
-    llm_client: OllamaClient | None = None,
+    llm_client: AntigravityClient | None = None,
     run_id: str | None = None,
     project_root: Path | str | None = None,
     reporter: ProgressReporter | None = None,
@@ -105,7 +157,9 @@ def run_agent_loop(
     resolved_test = (
         Path(test_file)
         if test_file is not None
-        else resolve_test_file_path(validated_target, config.paths.tests_dir)
+        else resolve_test_file_path(
+            validated_target, config.paths.tests_dir, project_root=root_dir
+        )
     )
     if not resolved_test.is_absolute():
         resolved_test = root_dir / resolved_test
@@ -128,7 +182,7 @@ def run_agent_loop(
 
     start_ns = time.perf_counter_ns()
     owns_client = llm_client is None
-    client = llm_client or OllamaClient(work_config)
+    client = llm_client or AntigravityClient(work_config)
 
     history: list[AgentIterationLog] = []
     stop_reason = "max_iters_reached"
@@ -184,6 +238,7 @@ def run_agent_loop(
         prev_mutation_score: float | None = None
         no_improve_streak: int = 0
         iterations_completed = 0
+        pending_verified_run: RunResult | None = None
 
         # Bước 3: Vòng lặp Agent (iteration = 1 .. eff_max_iters)
         for iteration in range(1, eff_max_iters + 1):
@@ -194,16 +249,20 @@ def run_agent_loop(
                 baseline=baseline,
             )
 
-            # 3a. Chạy run + coverage (+ mutation nếu test pass)
-            curr_run = run_tests(
-                target_file=validated_target,
-                config=work_config,
-                test_file=resolved_test,
-                project_root=root_dir,
-                enable_coverage=work_config.coverage.enabled,
-                enable_mutation=work_config.mutation.enabled,
-                reporter=rep,
-            )
+            # 3a. Tái sử dụng kết quả verify_run từ cuối pha improve vòng trước (tránh chạy lặp mutation)
+            if pending_verified_run is not None:
+                curr_run = pending_verified_run
+                pending_verified_run = None
+            else:
+                curr_run = run_tests(
+                    target_file=validated_target,
+                    config=work_config,
+                    test_file=resolved_test,
+                    project_root=root_dir,
+                    enable_coverage=work_config.coverage.enabled,
+                    enable_mutation=work_config.mutation.enabled,
+                    reporter=rep,
+                )
             last_run_result = curr_run
 
             # 3b. Nếu all_tests_passed == False -> Phân loại lỗi & gọi Fix có kiểm soát
@@ -288,6 +347,13 @@ def run_agent_loop(
                         stop_reason = f"unfixable_error:{curr_run.error_category.value}"
                     else:
                         stop_reason = f"fix_failed:{fix_res.stop_reason}"
+                    break
+
+            # Kiểm tra ngân sách chặt trước khi gọi LLM eval ở vòng >= 2
+            if iteration >= 2 and last_eval_report is not None:
+                b_reason = _budget_exceeded_reason()
+                if b_reason:
+                    stop_reason = b_reason
                     break
 
             # 3c. Khi all_tests_passed == True -> Đánh giá 2 tầng (eval)
@@ -410,8 +476,13 @@ def run_agent_loop(
 
             source_code = validated_target.read_text(encoding="utf-8")
             current_test_code = resolved_test.read_text(encoding="utf-8")
+            existing_fixtures: list[str] = []
+            existing_helpers: list[str] = []
             try:
-                existing_names = analyze_test_code(current_test_code, file_path=resolved_test).test_names
+                t_ana = analyze_test_code(current_test_code, file_path=resolved_test)
+                existing_names = t_ana.test_names
+                existing_fixtures = [f.source_code for f in t_ana.fixtures if f.source_code]
+                existing_helpers = [h.source_code for h in t_ana.helpers if h.source_code]
             except SyntaxError:
                 existing_names = []
 
@@ -421,21 +492,24 @@ def run_agent_loop(
                 existing_test_names=existing_names,
                 survived_mutants=survived_list,
                 missing_lines=curr_run.missing_lines,
+                existing_fixtures=existing_fixtures,
+                existing_helpers=existing_helpers,
                 project_root=root_dir,
             )
 
             calls_before_imp = client.total_calls
             tokens_before_imp = client.total_tokens
             with rep.step(
-                f"[Improve vòng {iteration}] Đang gọi Ollama ({work_config.model}) viết thêm test diệt {len(survived_list)} survived mutants",
-                done_message=f"[Improve vòng {iteration}] Ollama đã sinh xong các hàm test bổ sung",
+                f"[Improve vòng {iteration}] Đang gọi Antigravity ({work_config.effective_model_label}) viết thêm test diệt {len(survived_list)} survived mutants",
+                done_message=f"[Improve vòng {iteration}] Antigravity đã sinh xong các hàm test bổ sung",
             ):
                 imp_resp = client.chat(system_prompt=sys_imp, user_prompt=usr_imp)
             rep.on_llm_call_end(
                 task_name=f"improve#{iteration}",
-                model=imp_resp.model_actual or work_config.model,
+                model=imp_resp.model_actual or work_config.effective_model_label,
                 prompt_tokens=imp_resp.prompt_tokens,
                 completion_tokens=imp_resp.completion_tokens,
+                thinking_tokens=imp_resp.thinking_tokens,
                 latency_ms=imp_resp.latency_ms,
             )
 
@@ -492,6 +566,64 @@ def run_agent_loop(
                 and verify_mut_pct < curr_mut_pct - 1e-6
             )
 
+            # Selective Per-Function Acceptance: nếu thêm >= 2 hàm mới mà chỉ một phần hàm mới bị TEST_FAILURE,
+            # lọc bỏ hàm bị fail và giữ lại các hàm mới đã pass thay vì rollback trắng cả vòng improve
+            selective_used = False
+            if (
+                not verify_run.all_tests_passed
+                and len(append_res.added_tests) >= 2
+                and verify_run.error_category == ErrorCategory.TEST_FAILURE
+            ):
+                failing_names = set(
+                    extract_failing_test_names(f"{verify_run.stdout}\n{verify_run.stderr}")
+                )
+                added_set = set(append_res.added_tests)
+                if failing_names and failing_names.issubset(added_set) and len(added_set - failing_names) >= 1:
+                    filtered_code = _filter_failing_new_tests(
+                        imp_resp.content,
+                        failing_names,
+                        append_res.renamed_tests,
+                    )
+                    if filtered_code:
+                        if bak_improve:
+                            restore_backup(bak_improve, resolved_test)
+                        try:
+                            filtered_append = safe_merge_and_append(
+                                test_file=resolved_test,
+                                new_code=filtered_code,
+                                mode="append",
+                                backup_dir=root_dir / work_config.output.backup_dir,
+                                log_dir=root_dir / work_config.output.log_dir,
+                                run_id=effective_run_id,
+                            )
+                            if filtered_append.added_tests:
+                                filtered_run = run_tests(
+                                    target_file=validated_target,
+                                    config=work_config,
+                                    test_file=resolved_test,
+                                    project_root=root_dir,
+                                    enable_coverage=work_config.coverage.enabled,
+                                    enable_mutation=work_config.mutation.enabled,
+                                    reporter=rep,
+                                )
+                                filtered_mut_pct = (
+                                    filtered_run.mutation.mutation_score_pct
+                                    if (filtered_run.mutation and filtered_run.mutation.mutation_available)
+                                    else None
+                                )
+                                filtered_mut_dropped = (
+                                    curr_mut_pct is not None
+                                    and filtered_mut_pct is not None
+                                    and filtered_mut_pct < curr_mut_pct - 1e-6
+                                )
+                                if filtered_run.all_tests_passed and not filtered_mut_dropped:
+                                    append_res = filtered_append
+                                    verify_run = filtered_run
+                                    mut_dropped = False
+                                    selective_used = True
+                        except SafeAppendError:
+                            pass
+
             if not verify_run.all_tests_passed or mut_dropped:
                 guard_rejections += 1
                 if bak_improve:
@@ -516,6 +648,12 @@ def run_agent_loop(
                 )
             else:
                 last_run_result = verify_run
+                pending_verified_run = verify_run
+                ok_reason = (
+                    f"Selective Accept: giữ lại {len(append_res.added_tests)} hàm test mới pass qua Safe Append"
+                    if selective_used
+                    else f"Đã bổ sung {len(append_res.added_tests)} hàm test mới qua Safe Append"
+                )
                 history.append(
                     AgentIterationLog(
                         iteration=iteration,
@@ -525,7 +663,7 @@ def run_agent_loop(
                         llm_calls=client.total_calls - calls_before_imp,
                         tokens_used=client.total_tokens - tokens_before_imp,
                         accepted=True,
-                        reason=f"Đã bổ sung {len(append_res.added_tests)} hàm test mới qua Safe Append",
+                        reason=ok_reason,
                     )
                 )
 

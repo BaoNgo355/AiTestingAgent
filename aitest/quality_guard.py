@@ -93,6 +93,104 @@ def _is_existence_or_type_only_check(test_expr: ast.AST) -> tuple[bool, str]:
     return False, ""
 
 
+def _extract_abs_sub_operands(node: ast.AST) -> tuple[ast.AST, ast.AST] | None:
+    """Trả về `(a, b)` nếu node có dạng `abs(a - b)` với `a` khác `b` về cấu trúc AST."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "abs"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.BinOp)
+        and isinstance(node.args[0].op, ast.Sub)
+    ):
+        left, right = node.args[0].left, node.args[0].right
+        if ast.dump(left, include_attributes=False) != ast.dump(right, include_attributes=False):
+            return left, right
+    return None
+
+
+def _extract_small_positive_tol(node: ast.AST) -> float | None:
+    """Trả về giá trị dung sai dương `0 < tol <= 1e-2` nếu node là hằng số hợp lệ."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        val = float(node.value)
+        if 0.0 < val <= 1e-2:
+            return val
+    return None
+
+
+def _is_approx_float_check(expr: ast.AST) -> bool:
+    """Kiểm tra biểu thức có phải phép so sánh xấp xỉ số thực chặt chẽ (`math.isclose`, `abs(a - b) < 1e-6`) không."""
+    if isinstance(expr, ast.Call):
+        fn_name = _unparse(expr.func)
+        if fn_name in ("math.isclose", "isclose", "np.isclose", "numpy.isclose") and len(expr.args) >= 2:
+            if ast.dump(expr.args[0], include_attributes=False) != ast.dump(expr.args[1], include_attributes=False):
+                return True
+        return False
+
+    if isinstance(expr, ast.Compare) and len(expr.ops) == 1 and len(expr.comparators) == 1:
+        op = expr.ops[0]
+        left = expr.left
+        right = expr.comparators[0]
+        if isinstance(op, (ast.Lt, ast.LtE)):
+            return _extract_abs_sub_operands(left) is not None and _extract_small_positive_tol(right) is not None
+        if isinstance(op, (ast.Gt, ast.GtE)):
+            return _extract_small_positive_tol(left) is not None and _extract_abs_sub_operands(right) is not None
+
+    return False
+
+
+def _is_equivalent_bool_check(new_expr: ast.AST) -> bool:
+    """Kiểm tra xem biểu thức mới có phải phép kiểm tra boolean chặt (`is True`, `is False`, `assert expr`, `assert not expr`) không."""
+    # `expr is True` hoặc `expr is False`
+    if isinstance(new_expr, ast.Compare) and len(new_expr.ops) == 1 and len(new_expr.comparators) == 1:
+        op = new_expr.ops[0]
+        right = new_expr.comparators[0]
+        if isinstance(op, ast.Is) and isinstance(right, ast.Constant) and isinstance(right.value, bool):
+            return True
+        return False
+
+    # `assert not expr` (không phải tautology, không phải kiểm tra tồn tại/kiểu)
+    if isinstance(new_expr, ast.UnaryOp) and isinstance(new_expr.op, ast.Not):
+        is_taut, _ = _is_tautology_expr(new_expr)
+        is_taut_inner, _ = _is_tautology_expr(new_expr.operand)
+        is_exist, _ = _is_existence_or_type_only_check(new_expr.operand)
+        return not is_taut and not is_taut_inner and not is_exist
+
+    # `assert expr` (không phải tautology, không phải kiểm tra tồn tại/kiểu)
+    is_taut, _ = _is_tautology_expr(new_expr)
+    is_exist, _ = _is_existence_or_type_only_check(new_expr)
+    return not is_taut and not is_exist
+
+
+def _effective_assert_count(assertions: list[AssertionInfo]) -> int:
+    """Đếm số kiểm tra hiệu dụng (`pytest.raises(..., match=...)` tính thêm 1 kiểm tra message)."""
+    return len(assertions) + sum(
+        1 for a in assertions if a.kind == "pytest_raises" and a.has_match
+    )
+
+
+def _extract_subject_key(a: AssertionInfo) -> str:
+    """Trích xuất khóa biểu thức chủ thể bên trái để ghép cặp assertion thông minh."""
+    expr = _parse_assert_expr(a.source)
+    if expr is None:
+        return ""
+    if isinstance(expr, ast.Compare) and len(expr.ops) == 1 and len(expr.comparators) == 1:
+        abs_ops = _extract_abs_sub_operands(expr.left)
+        if abs_ops is not None:
+            return ast.dump(abs_ops[0], include_attributes=False)
+        abs_ops_r = _extract_abs_sub_operands(expr.comparators[0])
+        if abs_ops_r is not None:
+            return ast.dump(abs_ops_r[0], include_attributes=False)
+        return ast.dump(expr.left, include_attributes=False)
+    if isinstance(expr, ast.Call):
+        fn_name = _unparse(expr.func)
+        if fn_name in ("math.isclose", "isclose", "np.isclose", "numpy.isclose") and len(expr.args) >= 2:
+            return ast.dump(expr.args[0], include_attributes=False)
+    if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+        return ast.dump(expr.operand, include_attributes=False)
+    return ast.dump(expr, include_attributes=False)
+
+
 def _parse_assert_expr(assertion_source: str) -> ast.AST | None:
     """Trích xuất node `test` bên trong câu lệnh `assert <test>`."""
     try:
@@ -188,6 +286,31 @@ def _compare_single_assertion_pair(
 
         # Nếu biểu thức cũ là so sánh bằng (==)
         if isinstance(old_op, ast.Eq):
+            # Cho phép chuyển sang phép so sánh xấp xỉ số thực chặt (`math.isclose`, `abs(a - b) < 1e-6`)
+            if _is_approx_float_check(new_expr):
+                return AssertionDiffEntry(
+                    test_name=test_name,
+                    old_assertion=old_a.source,
+                    new_assertion=new_a.source,
+                    classification="allowed_value_update",
+                    reason="Chuyển sang phép so sánh xấp xỉ số thực có dung sai chặt",
+                )
+
+            # Cho phép chuẩn hóa/sửa giá trị kiểm tra boolean (`== True/False` -> `is True/False`, `assert expr`, `assert not expr`)
+            if (
+                len(old_expr.comparators) == 1
+                and isinstance(old_expr.comparators[0], ast.Constant)
+                and isinstance(old_expr.comparators[0].value, bool)
+                and _is_equivalent_bool_check(new_expr)
+            ):
+                return AssertionDiffEntry(
+                    test_name=test_name,
+                    old_assertion=old_a.source,
+                    new_assertion=new_a.source,
+                    classification="allowed_value_update",
+                    reason="Chuẩn hóa phép kiểm tra hằng số boolean tương đương",
+                )
+
             if not isinstance(new_expr, ast.Compare) or len(new_expr.ops) != 1:
                 return AssertionDiffEntry(
                     test_name=test_name,
@@ -236,11 +359,106 @@ def _compare_single_assertion_pair(
     )
 
 
+def _pair_assertions_smart(
+    old_items: list[AssertionInfo],
+    new_items: list[AssertionInfo],
+    *,
+    by_exception: bool = False,
+) -> tuple[list[tuple[AssertionInfo, AssertionInfo]], list[AssertionInfo], list[AssertionInfo]]:
+    """Ghép cặp thông minh hai danh sách assertion cùng loại (`pytest_raises` hoặc `assert`).
+
+    Ưu tiên: (1) Khớp chính xác `ast_dump` -> (2) Khớp cùng `raised_exception` hoặc `_extract_subject_key`
+    -> (3) Ghép tuần tự các phần tử còn lại. Trả về `(pairs, unmatched_old, unmatched_new)`.
+    """
+    used_old: set[int] = set()
+    used_new: set[int] = set()
+    pairs: list[tuple[AssertionInfo, AssertionInfo]] = []
+
+    # Bước 1: Khớp chính xác ast_dump
+    for oi, old_a in enumerate(old_items):
+        for ni, new_a in enumerate(new_items):
+            if ni not in used_new and old_a.ast_dump == new_a.ast_dump:
+                used_old.add(oi)
+                used_new.add(ni)
+                pairs.append((old_a, new_a))
+                break
+
+    # Bước 2: Khớp theo khóa ngoại lệ hoặc biểu thức chủ thể bên trái
+    if by_exception:
+        for oi, old_a in enumerate(old_items):
+            if oi in used_old or not old_a.raised_exception:
+                continue
+            for ni, new_a in enumerate(new_items):
+                if ni not in used_new and new_a.raised_exception == old_a.raised_exception:
+                    used_old.add(oi)
+                    used_new.add(ni)
+                    pairs.append((old_a, new_a))
+                    break
+    else:
+        old_keys = {oi: _extract_subject_key(old_a) for oi, old_a in enumerate(old_items) if oi not in used_old}
+        new_keys = {ni: _extract_subject_key(new_a) for ni, new_a in enumerate(new_items) if ni not in used_new}
+        for oi, okey in old_keys.items():
+            if not okey:
+                continue
+            for ni, nkey in new_keys.items():
+                if ni not in used_new and nkey == okey:
+                    used_old.add(oi)
+                    used_new.add(ni)
+                    pairs.append((old_items[oi], new_items[ni]))
+                    break
+
+    # Bước 3: Ghép tuần tự phần còn lại
+    rem_old = [old_items[i] for i in range(len(old_items)) if i not in used_old]
+    rem_new = [new_items[i] for i in range(len(new_items)) if i not in used_new]
+    seq_count = min(len(rem_old), len(rem_new))
+    for i in range(seq_count):
+        pairs.append((rem_old[i], rem_new[i]))
+
+    return pairs, rem_old[seq_count:], rem_new[seq_count:]
+
+
+def _extract_absorbed_exc_vars(
+    old_fn: TestFunctionInfo,
+    raise_pairs: list[tuple[AssertionInfo, AssertionInfo]],
+) -> set[str]:
+    """Tìm tên biến ngoại lệ (`as exc_info`) từ các khối `pytest.raises` đã nâng cấp lên `match=...`."""
+    upgraded_lines = {
+        o_r.lineno for o_r, n_r in raise_pairs if not o_r.has_match and n_r.has_match
+    }
+    if not upgraded_lines or not old_fn.source_code:
+        return set()
+
+    exc_vars: set[str] = set()
+    try:
+        tree = ast.parse(old_fn.source_code)
+    except SyntaxError:
+        return exc_vars
+
+    for sub in ast.walk(tree):
+        if isinstance(sub, (ast.With, ast.AsyncWith)):
+            for item in sub.items:
+                if item.optional_vars is not None and isinstance(item.optional_vars, ast.Name):
+                    # Kiểm tra xem lệnh `with` này nằm trong nhóm `pytest.raises` được nâng cấp lên `match=`
+                    ctx_src = _unparse(item.context_expr)
+                    if "raises" in ctx_src:
+                        exc_vars.add(item.optional_vars.id)
+    return exc_vars
+
+
+def _uses_any_name(source: str, names: set[str]) -> bool:
+    if not names:
+        return False
+    expr = _parse_assert_expr(source)
+    if expr is None:
+        return False
+    return any(isinstance(sub, ast.Name) and sub.id in names for sub in ast.walk(expr))
+
+
 def _analyze_function_assertion_diffs(
     old_fn: TestFunctionInfo,
     new_fn: TestFunctionInfo,
 ) -> tuple[list[AssertionDiffEntry], list[str]]:
-    """So sánh danh sách assertions của một hàm test trước và sau khi sửa."""
+    """So sánh danh sách assertions của một hàm test trước và sau khi sửa bằng Smart AST Alignment."""
     diffs: list[AssertionDiffEntry] = []
     reasons: list[str] = []
 
@@ -262,41 +480,49 @@ def _analyze_function_assertion_diffs(
             )
         )
 
-    if len(new_fn.assertions) < len(old_fn.assertions):
+    old_raw_count = len(old_fn.assertions)
+    new_raw_count = len(new_fn.assertions)
+    new_eff_count = _effective_assert_count(new_fn.assertions)
+    if new_raw_count < old_raw_count and new_eff_count < old_raw_count:
         reasons.append(
             f"Hàm `{old_fn.name}` bị giảm số câu lệnh kiểm tra "
-            f"(trước: {len(old_fn.assertions)}, sau: {len(new_fn.assertions)})"
+            f"(trước: {old_raw_count}, sau: {new_raw_count})"
         )
 
-    pair_count = min(len(old_fn.assertions), len(new_fn.assertions))
-    for idx in range(pair_count):
-        entry = _compare_single_assertion_pair(
-            old_fn.name,
-            old_fn.assertions[idx],
-            new_fn.assertions[idx],
-        )
+    raise_pairs, _, _ = _pair_assertions_smart(old_raises, new_raises, by_exception=True)
+    absorbed_vars = _extract_absorbed_exc_vars(old_fn, raise_pairs)
+
+    old_asserts = [
+        a for a in old_fn.assertions
+        if a.kind == "assert" and not _uses_any_name(a.source, absorbed_vars)
+    ]
+    new_asserts = [a for a in new_fn.assertions if a.kind == "assert"]
+
+    assert_pairs, _, extra_new_asserts = _pair_assertions_smart(old_asserts, new_asserts, by_exception=False)
+
+    for old_a, new_a in [*raise_pairs, *assert_pairs]:
+        entry = _compare_single_assertion_pair(old_fn.name, old_a, new_a)
         if entry.classification != "unchanged":
             diffs.append(entry)
         if entry.classification == "weakened":
             reasons.append(f"Assertion Weakening tại `{old_fn.name}`: {entry.reason}")
 
     # Kiểm tra các assertion được thêm mới trong hàm cũng không được là tautology
-    for extra_a in new_fn.assertions[pair_count:]:
-        if extra_a.kind == "assert":
-            expr = _parse_assert_expr(extra_a.source)
-            if expr is not None:
-                is_taut, taut_reason = _is_tautology_expr(expr)
-                if is_taut:
-                    diffs.append(
-                        AssertionDiffEntry(
-                            test_name=new_fn.name,
-                            old_assertion="<none>",
-                            new_assertion=extra_a.source,
-                            classification="weakened",
-                            reason=taut_reason,
-                        )
+    for extra_a in extra_new_asserts:
+        expr = _parse_assert_expr(extra_a.source)
+        if expr is not None:
+            is_taut, taut_reason = _is_tautology_expr(expr)
+            if is_taut:
+                diffs.append(
+                    AssertionDiffEntry(
+                        test_name=new_fn.name,
+                        old_assertion="<none>",
+                        new_assertion=extra_a.source,
+                        classification="weakened",
+                        reason=taut_reason,
                     )
-                    reasons.append(f"Tautology mới thêm tại `{new_fn.name}`: {taut_reason}")
+                )
+                reasons.append(f"Tautology mới thêm tại `{new_fn.name}`: {taut_reason}")
 
     return diffs, reasons
 
@@ -367,8 +593,15 @@ def check_quality_guard(
     if new_test_count == 0:
         reasons.append("File test mới không chứa bất kỳ hàm `test_*` nào")
 
-    # 2. Tổng số assert + pytest.raises không giảm
-    if old_assert_count > 0 and new_assert_count < old_assert_count * cfg.min_assert_count_ratio:
+    # 2. Tổng số assert + pytest.raises không giảm (công nhận pytest.raises(..., match=...) tương đương thêm 1 kiểm tra message)
+    new_effective_assert_count = sum(
+        _effective_assert_count(fn.assertions) for fn in new_analysis.test_functions
+    )
+    if (
+        old_assert_count > 0
+        and new_assert_count < old_assert_count * cfg.min_assert_count_ratio
+        and new_effective_assert_count < old_assert_count * cfg.min_assert_count_ratio
+    ):
         reasons.append(
             f"Tổng số câu lệnh kiểm tra (assert + pytest.raises) bị giảm từ {old_assert_count} xuống {new_assert_count}"
         )

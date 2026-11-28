@@ -151,3 +151,55 @@ def test_runner_timeout_kills_process_and_sets_null_pass_rate_ac15_ac20(tmp_path
     assert res.all_tests_passed is False
     assert res.error_category == ErrorCategory.TIMEOUT
     assert res.pass_rate is None
+
+
+def test_classifier_distinguishes_explicit_domain_raise_from_internal_source_bug(
+    tmp_path: Path,
+) -> None:
+    """Kiểm tra P1.7: Lệnh `raise` tường minh trong file nguồn -> TEST_FAILURE; crash ngoài ý muốn -> SOURCE_ERROR."""
+    target = tmp_path / "inv.py"
+    target.write_text(
+        "def get_item(items: dict, key: str) -> int:\n"
+        "    if key not in items:\n"
+        "        raise KeyError(f'Missing {key}')\n"
+        "    return items[key]\n\n"
+        "def buggy_ratio(a: int, b: int) -> float:\n"
+        "    return a / b\n",
+        encoding="utf-8",
+    )
+    test_f = tmp_path / "test_inv.py"
+    test_f.write_text("def test_inv():\n    assert True\n", encoding="utf-8")
+
+    # Ngoại lệ nghiệp vụ tại dòng 3 (lệnh raise KeyError tường minh) -> TEST_FAILURE
+    cat_explicit, _ = classify_pytest_error(
+        exit_code=1,
+        stdout=(
+            "test_inv.py:3: in test_inv\n"
+            "    get_item({}, 'x')\n"
+            "inv.py:3: in get_item\n"
+            "    raise KeyError(f'Missing {key}')\n"
+            "E   KeyError: 'Missing x'"
+        ),
+        stderr="",
+        target_file=target,
+        test_file=test_f,
+    )
+    assert cat_explicit == ErrorCategory.TEST_FAILURE
+    assert cat_explicit.is_fixable_by_llm is True
+
+    # Lỗi chia cho 0 ngoài ý muốn tại dòng 7 (không phải lệnh raise) -> SOURCE_ERROR
+    cat_bug, _ = classify_pytest_error(
+        exit_code=1,
+        stdout=(
+            "test_inv.py:6: in test_inv\n"
+            "    buggy_ratio(1, 0)\n"
+            "inv.py:7: in buggy_ratio\n"
+            "    return a / b\n"
+            "E   ZeroDivisionError: division by zero"
+        ),
+        stderr="",
+        target_file=target,
+        test_file=test_f,
+    )
+    assert cat_bug == ErrorCategory.SOURCE_ERROR
+    assert cat_bug.is_fixable_by_llm is False

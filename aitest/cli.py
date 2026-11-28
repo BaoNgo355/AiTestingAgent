@@ -1,26 +1,30 @@
-"""Giao diện dòng lệnh (CLI) đầy đủ 6 lệnh cho aitest sử dụng Typer và Rich (SRS v2.3.0 §6.2, §7 FR-01..FR-07, §9.1)."""
+"""Giao diện dòng lệnh (CLI) đầy đủ 6 lệnh cho aitest sử dụng Typer và Rich (SRS v3.0.0 §6.2, §7 FR-01..FR-08, §9.1)."""
 
 from __future__ import annotations
 
 import importlib.util
+import os
+import shutil
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-import httpx
 import typer
 from rich.console import Console
 from rich.panel import Panel
 
 from aitest import __version__
 from aitest.agent import run_agent_loop
-from aitest.config import DEFAULT_AITEST_YAML_TEMPLATE, load_config
+from aitest.config import DEFAULT_AITEST_YAML_TEMPLATE, load_config, normalize_output_format
 from aitest.evaluator import evaluate_test_suite
 from aitest.fixer import fix_test_file
 from aitest.generator import SafeAppendError, generate_tests
-from aitest.llm.client import OllamaError
+from aitest.llm.client import (
+    AntigravityClient,
+    AntigravityError,
+    validate_sdk_credentials,
+)
 from aitest.output import (
-    emit_eval_report_json,
-    print_agent_summary,
+    deliver_report,
     print_fix_result,
     print_gen_result,
     print_run_result,
@@ -32,7 +36,7 @@ from aitest.utils import atomic_write_text
 
 app = typer.Typer(
     name="aitest",
-    help="CLI AI Agent hỗ trợ tự động sinh, cải thiện và đánh giá Unit Test Python bằng LLM qua Ollama.",
+    help="CLI AI Agent hỗ trợ tự động sinh, cải thiện và đánh giá Unit Test Python bằng Google Antigravity SDK.",
     add_completion=False,
     no_args_is_help=True,
 )
@@ -49,6 +53,19 @@ def _version_callback(value: bool) -> None:
 def _fail_with_error(message: str, code: int = 1) -> None:
     err_console.print(f"[bold red]Lỗi:[/bold red] {message}")
     raise typer.Exit(code=code)
+
+
+def _build_cli_overrides(
+    *,
+    model: str | None = None,
+    judge_model: str | None = None,
+) -> dict[str, Any] | None:
+    overrides: dict[str, Any] = {}
+    if model is not None and model.strip():
+        overrides["model"] = model.strip()
+    if judge_model is not None and judge_model.strip():
+        overrides.setdefault("eval", {})["judge_model"] = judge_model.strip()
+    return overrides or None
 
 
 @app.callback()
@@ -87,8 +104,9 @@ def init_cmd(
 
     env_example_path = Path(".env.example")
     env_example_content = (
-        "OLLAMA_BASE_URL=http://localhost:11434\n"
-        "# OLLAMA_API_KEY=...   # chỉ cần nếu kết nối tới Ollama remote có bật xác thực\n"
+        "# Khóa API cho Google Antigravity SDK (tạo tại https://aistudio.google.com/app/api-keys)\n"
+        "GEMINI_API_KEY=your_gemini_api_key_here\n"
+        "# AITEST_MODEL=gemini-3.8-flash\n"
     )
     if env_example_path.exists() and not force:
         skipped_files.append(".env.example (đã tồn tại)")
@@ -118,24 +136,30 @@ def init_cmd(
             missing_pkgs.append(pkg)
 
     cfg = load_config()
-    ollama_status = ""
-    try:
-        resp = httpx.get(f"{cfg.base_url}/api/tags", timeout=5.0)
-        resp.raise_for_status()
-        tags_data = resp.json()
-        models = [m.get("name", "") for m in tags_data.get("models", [])]
-        if any(m == cfg.model or m.startswith(f"{cfg.model}:") for m in models):
-            ollama_status = f"[green]Đã kết nối Ollama ({cfg.base_url}) - Model '{cfg.model}' đã sẵn sàng.[/green]"
-        else:
-            ollama_status = (
-                f"[yellow]Đã kết nối Ollama ({cfg.base_url}) nhưng chưa thấy model '{cfg.model}'.\n"
-                f"Gợi ý: chạy `ollama pull {cfg.model}`[/yellow]"
-            )
-    except Exception:
-        ollama_status = (
-            f"[yellow]Không kết nối được Ollama tại {cfg.base_url}.\n"
-            f"Gợi ý: chạy `ollama serve` và `ollama pull {cfg.model}`[/yellow]"
+    sdk_installed = importlib.util.find_spec("google.antigravity") is not None
+    antigravity_status = ""
+    if not sdk_installed:
+        antigravity_status = (
+            "[bold red]Chưa cài gói `google-antigravity`.[/bold red] "
+            "Cài đặt bằng: `pip install \"google-antigravity>=0.1.24\"`."
         )
+    else:
+        try:
+            validate_sdk_credentials(cfg)
+            mode_label = "Vertex AI" if cfg.llm.vertex else "Gemini API (GEMINI_API_KEY)"
+            judge_note = (
+                f" | Judge model: '{cfg.eval.judge_model}'."
+                if cfg.eval.judge_model
+                else ""
+            )
+            antigravity_status = (
+                f"[green]Google Antigravity SDK đã sẵn sàng - Chế độ: {mode_label}, "
+                f"model hiệu dụng: '{cfg.effective_model_label}'.[/green]{judge_note}"
+            )
+        except AntigravityError as exc:
+            antigravity_status = f"[yellow]{exc}[/yellow]"
+        except Exception as exc:
+            antigravity_status = f"[yellow]Chưa kiểm tra được trạng thái Google Antigravity SDK: {exc}[/yellow]"
 
     lines: list[str] = []
     if created_files:
@@ -151,7 +175,14 @@ def init_cmd(
         )
     else:
         lines.append("[green]Môi trường kiểm thử:[/green] pytest, pytest-cov và AST Mutation Engine đã sẵn sàng.")
-    lines.append(f"Trạng thái Ollama: {ollama_status}")
+
+    if os.name != "nt" and cfg.mutation.tool == "mutmut" and shutil.which("mutmut") is None:
+        lines.append(
+            "[yellow]Lưu ý mutation backend:[/yellow] `mutation.tool=mutmut` nhưng chưa thấy lệnh `mutmut`. "
+            "Cài đặt bằng: `pip install \"mutmut>=3,<4\"` hoặc chuyển sang `tool: auto`."
+        )
+
+    lines.append(f"Trạng thái Antigravity: {antigravity_status}")
 
     console.print(Panel("\n".join(lines), title="aitest init", border_style="cyan"))
 
@@ -170,7 +201,16 @@ def gen_cmd(
         "--no-llm-dedup",
         help="Không gửi danh sách tên hàm test hiện có vào prompt LLM (Safe Append vẫn dedup bằng AST).",
     ),
-    model: Optional[str] = typer.Option(None, "--model", help="Ghi đè tên model Ollama."),
+    test_file: Optional[Path] = typer.Option(
+        None,
+        "--test-file",
+        help="Đường dẫn file test đích tùy chọn.",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-3.8-flash).",
+    ),
     quiet: bool = typer.Option(
         False,
         "--quiet",
@@ -190,17 +230,19 @@ def gen_cmd(
     lit_mode: Literal["append", "overwrite"] = "overwrite" if norm_mode == "overwrite" else "append"
 
     try:
-        cfg = load_config(cli_overrides={"model": model} if model else None)
+        overrides = _build_cli_overrides(model=model)
+        cfg = load_config(cli_overrides=overrides)
         reporter = RichProgressReporter(console=err_console, quiet=quiet, verbose=verbose)
         res = generate_tests(
             target_file=file,
             config=cfg,
             mode=lit_mode,
             no_llm_dedup=no_llm_dedup,
+            test_file=test_file,
             reporter=reporter,
         )
         print_gen_result(console, res, target_file=file)
-    except (ValueError, FileNotFoundError, SyntaxError, SafeAppendError, OllamaError) as exc:
+    except (ValueError, FileNotFoundError, SyntaxError, SafeAppendError, AntigravityError) as exc:
         _fail_with_error(str(exc), code=1)
 
 
@@ -223,6 +265,11 @@ def run_cmd(
         "-t",
         help="Timeout thực thi pytest (giây, mặc định 120s).",
     ),
+    test_file: Optional[Path] = typer.Option(
+        None,
+        "--test-file",
+        help="Đường dẫn file test đích tùy chọn.",
+    ),
     quiet: bool = typer.Option(
         False,
         "--quiet",
@@ -244,6 +291,7 @@ def run_cmd(
         res = run_tests(
             target_file=file,
             config=cfg,
+            test_file=test_file,
             enable_coverage=cov,
             enable_mutation=mutation,
             timeout_sec=timeout,
@@ -269,7 +317,16 @@ def fix_cmd(
         "--dry-run",
         help="Chỉ kiểm tra Quality Guard và hiển thị unified diff, không ghi đè file test.",
     ),
-    model: Optional[str] = typer.Option(None, "--model", help="Ghi đè tên model Ollama."),
+    test_file: Optional[Path] = typer.Option(
+        None,
+        "--test-file",
+        help="Đường dẫn file test đích tùy chọn.",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-3.8-flash).",
+    ),
     quiet: bool = typer.Option(
         False,
         "--quiet",
@@ -284,7 +341,7 @@ def fix_cmd(
 ) -> None:
     """Sửa lỗi file test tự động có kiểm soát với Quality Guard và AST Assertion Diff (FR-04)."""
     try:
-        overrides = {"model": model} if model else None
+        overrides = _build_cli_overrides(model=model)
         cfg = load_config(cli_overrides=overrides)
         if not quiet:
             print_safety_notice(console)
@@ -292,6 +349,7 @@ def fix_cmd(
         res = fix_test_file(
             target_file=file,
             config=cfg,
+            test_file=test_file,
             max_iters=max_iters,
             dry_run=dry_run,
             reporter=reporter,
@@ -299,35 +357,50 @@ def fix_cmd(
         print_fix_result(console, res)
         if not res.fixed and not res.dry_run:
             raise typer.Exit(code=1)
-    except (ValueError, FileNotFoundError, SyntaxError, OllamaError) as exc:
+    except (ValueError, FileNotFoundError, SyntaxError, AntigravityError) as exc:
         _fail_with_error(str(exc), code=1)
 
 
 @app.command("eval")
 def eval_cmd(
     file: str = typer.Argument(..., help="Đường dẫn tới file Python (.py) mục tiêu."),
-    format: str = typer.Option(
-        "json",
+    format: Optional[str] = typer.Option(
+        None,
         "--format",
-        help="Định dạng xuất báo cáo (MVP hỗ trợ 'json').",
+        "-f",
+        help="Định dạng xuất báo cáo: json, md, html (mặc định tự động theo Smart TTY hoặc đuôi file -o).",
     ),
     output: Optional[Path] = typer.Option(
         None,
         "--output",
         "-o",
-        help="Đường dẫn file để ghi báo cáo EvalReport JSON.",
+        help="Đường dẫn file để ghi báo cáo EvalReport (hỗ trợ .json, .md, .html).",
     ),
     no_mutation: bool = typer.Option(
         False,
         "--no-mutation",
         help="Tắt Mutation Testing (báo cáo sẽ được đánh dấu report_comparable = false).",
     ),
-    model: Optional[str] = typer.Option(None, "--model", help="Ghi đè tên model Ollama."),
+    test_file: Optional[Path] = typer.Option(
+        None,
+        "--test-file",
+        help="Đường dẫn file test đích tùy chọn.",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-3.8-flash).",
+    ),
+    judge_model: Optional[str] = typer.Option(
+        None,
+        "--judge-model",
+        help="Chỉ định model riêng cho bước chấm điểm rubric.",
+    ),
     quiet: bool = typer.Option(
         False,
         "--quiet",
         "-q",
-        help="Tắt toàn bộ hiển thị tiến độ trên stderr (chỉ xuất JSON ra stdout).",
+        help="Tắt toàn bộ hiển thị tiến độ trên stderr (chỉ xuất báo cáo ra stdout).",
     ),
     verbose: bool = typer.Option(
         False,
@@ -335,22 +408,31 @@ def eval_cmd(
         help="Hiển thị thêm chi tiết token, latency và từng mutant trên stderr.",
     ),
 ) -> None:
-    """Đánh giá chất lượng unit test theo mô hình 2 tầng và xuất báo cáo JSON chuẩn Pydantic (FR-05)."""
-    if format.strip().lower() != "json":
-        _fail_with_error("MVP chỉ hỗ trợ định dạng xuất '--format json'.")
+    """Đánh giá chất lượng unit test theo mô hình 2 tầng và xuất báo cáo chuẩn (json/md/html) (FR-05)."""
     try:
-        cfg = load_config(cli_overrides={"model": model} if model else None)
+        if format is not None:
+            normalize_output_format(format)
+        overrides = _build_cli_overrides(model=model, judge_model=judge_model)
+        cfg = load_config(cli_overrides=overrides)
         if not quiet:
             print_safety_notice(err_console)
         reporter = RichProgressReporter(console=err_console, quiet=quiet, verbose=verbose)
         report = evaluate_test_suite(
             target_file=file,
             config=cfg,
+            test_file=test_file,
             enable_mutation=(False if no_mutation else cfg.mutation.enabled),
             reporter=reporter,
         )
-        emit_eval_report_json(report, output_file=output, print_to_stdout=True)
-    except (ValueError, FileNotFoundError, SyntaxError, OllamaError) as exc:
+        deliver_report(
+            report,
+            explicit_format=format,
+            config_format=cfg.output.format,
+            output_file=output,
+            ui_console=err_console,
+            quiet=quiet,
+        )
+    except (ValueError, FileNotFoundError, SyntaxError, AntigravityError) as exc:
         _fail_with_error(str(exc), code=1)
 
 
@@ -375,7 +457,7 @@ def agent_cmd(
     max_total_tokens: Optional[int] = typer.Option(
         None,
         "--max-total-tokens",
-        help="Ngân sách tổng số token tối đa (mặc định 200000).",
+        help="Ngân sách tổng số token tối đa (mặc định 400000).",
     ),
     max_runtime_sec: Optional[int] = typer.Option(
         None,
@@ -387,18 +469,38 @@ def agent_cmd(
         "--baseline",
         help="Chạy nhánh đối sánh Baseline A (sinh test + sửa lỗi nếu có + đánh giá 1 lần, bỏ qua vòng lặp improve).",
     ),
+    format: Optional[str] = typer.Option(
+        None,
+        "--format",
+        "-f",
+        help="Định dạng xuất báo cáo: json, md, html (mặc định tự động theo Smart TTY hoặc đuôi file -o).",
+    ),
     output: Optional[Path] = typer.Option(
         None,
         "--output",
         "-o",
-        help="Ghi báo cáo EvalReport JSON cuối cùng ra file.",
+        help="Ghi báo cáo EvalReport cuối cùng ra file (hỗ trợ .json, .md, .html).",
     ),
-    model: Optional[str] = typer.Option(None, "--model", help="Ghi đè tên model Ollama."),
+    test_file: Optional[Path] = typer.Option(
+        None,
+        "--test-file",
+        help="Đường dẫn file test đích tùy chọn.",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-3.8-flash).",
+    ),
+    judge_model: Optional[str] = typer.Option(
+        None,
+        "--judge-model",
+        help="Chỉ định model riêng cho bước chấm điểm rubric.",
+    ),
     quiet: bool = typer.Option(
         False,
         "--quiet",
         "-q",
-        help="Tắt toàn bộ hiển thị tiến độ trên stderr (chỉ xuất JSON ra stdout).",
+        help="Tắt toàn bộ hiển thị tiến độ trên stderr (chỉ xuất báo cáo ra stdout).",
     ),
     verbose: bool = typer.Option(
         False,
@@ -408,13 +510,17 @@ def agent_cmd(
 ) -> None:
     """Thực thi vòng lặp Agent tự động: gen -> run -> fix -> mutation -> eval -> improve (FR-06)."""
     try:
-        cfg = load_config(cli_overrides={"model": model} if model else None)
+        if format is not None:
+            normalize_output_format(format)
+        overrides = _build_cli_overrides(model=model, judge_model=judge_model)
+        cfg = load_config(cli_overrides=overrides)
         if not quiet:
             print_safety_notice(err_console)
         reporter = RichProgressReporter(console=err_console, quiet=quiet, verbose=verbose)
         agent_res = run_agent_loop(
             target_file=file,
             config=cfg,
+            test_file=test_file,
             max_iters=max_iters,
             threshold_pass=threshold,
             max_llm_calls=max_llm_calls,
@@ -423,8 +529,18 @@ def agent_cmd(
             baseline=baseline,
             reporter=reporter,
         )
-        if not quiet:
-            print_agent_summary(err_console, agent_res)
-        emit_eval_report_json(agent_res.final_report, output_file=output, print_to_stdout=True)
-    except (ValueError, FileNotFoundError, SyntaxError, SafeAppendError, OllamaError) as exc:
+        deliver_report(
+            agent_res.final_report,
+            agent_result=agent_res,
+            explicit_format=format,
+            config_format=cfg.output.format,
+            output_file=output,
+            ui_console=err_console,
+            quiet=quiet,
+        )
+    except (ValueError, FileNotFoundError, SyntaxError, SafeAppendError, AntigravityError) as exc:
         _fail_with_error(str(exc), code=1)
+
+
+if __name__ == "__main__":
+    app()

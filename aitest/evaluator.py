@@ -1,4 +1,4 @@
-"""Đánh giá chất lượng Unit Test theo mô hình 2 tầng: Chỉ số khách quan + LLM Rubric (SRS v2.3.0 §7 FR-05, §8, AC-09..AC-11, AC-18..AC-23)."""
+"""Đánh giá chất lượng Unit Test theo mô hình 2 tầng: Chỉ số khách quan + LLM Rubric (SRS v3.0.0 §7 FR-05, §8, AC-09..AC-11, AC-18..AC-23)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 from aitest import __version__
 from aitest.config import AitestConfig
 from aitest.context import build_eval_prompts
-from aitest.llm.client import OllamaClient
+from aitest.llm.client import AntigravityClient
 from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.runner import run_tests
 from aitest.schemas import EvalReport, Meta, RunResult, build_eval_report
@@ -35,7 +35,7 @@ def evaluate_test_suite(
     *,
     test_file: Path | str | None = None,
     run_result: RunResult | None = None,
-    llm_client: OllamaClient | None = None,
+    llm_client: AntigravityClient | None = None,
     run_id: str | None = None,
     enable_mutation: bool | None = None,
     project_root: Path | str | None = None,
@@ -45,7 +45,7 @@ def evaluate_test_suite(
 
     1. Nếu `run_result` chưa được truyền vào -> gọi `run_tests` để đo chỉ số khách quan
        (pytest pass/fail, line coverage, mutation score & survived mutants).
-    2. Gọi LLM qua `generate_structured_assessment` để lấy 6 điểm chủ quan (`LLMAssessment`).
+    2. Gọi Antigravity qua `generate_structured_assessment` để lấy 6 điểm chủ quan (`LLMAssessment`).
     3. Áp dụng trần `correctness <= mutation_score_10 + correctness_cap_offset` khi `mutation_available == True`.
     4. Chuẩn hóa `weights_effective`, tính `weighted_score` từ điểm gốc chưa làm tròn và xác định `report_comparable`.
     """
@@ -59,7 +59,9 @@ def evaluate_test_suite(
     resolved_test = (
         Path(test_file)
         if test_file is not None
-        else resolve_test_file_path(validated_target, config.paths.tests_dir)
+        else resolve_test_file_path(
+            validated_target, config.paths.tests_dir, project_root=root_dir
+        )
     )
     if not resolved_test.is_absolute():
         resolved_test = root_dir / resolved_test
@@ -96,29 +98,38 @@ def evaluate_test_suite(
         objective_metrics=objective_metrics,
     )
 
+    judge_model_override = config.eval.judge_model or config.model
+    judge_model_requested = config.eval.judge_model or config.effective_model_label
     owns_client = llm_client is None
-    client = llm_client or OllamaClient(config)
+    client = llm_client or AntigravityClient(config)
+    prev_model_actual = client.last_model_actual
     try:
         with rep.step(
-            f"Đang gọi Ollama ({config.model}) chấm điểm Rubric 2 tầng cho '{resolved_test.name}'",
-            done_message=f"Ollama ({config.model}) đã hoàn tất chấm điểm Rubric",
+            f"Đang gọi Antigravity ({judge_model_requested}) chấm điểm Rubric 2 tầng cho '{resolved_test.name}'",
+            done_message=f"Antigravity ({judge_model_requested}) đã hoàn tất chấm điểm Rubric",
         ):
             llm_assessment, llm_resp = client.generate_structured_assessment(
                 system_prompt=sys_prompt,
                 user_prompt=usr_prompt,
                 run_id=effective_run_id,
                 log_dir=root_dir / config.output.log_dir,
+                model_override=judge_model_override,
             )
         rep.on_llm_call_end(
             task_name="eval",
-            model=llm_resp.model_actual or config.model,
+            model=llm_resp.model_actual or judge_model_requested,
             prompt_tokens=llm_resp.prompt_tokens,
             completion_tokens=llm_resp.completion_tokens,
+            thinking_tokens=llm_resp.thinking_tokens,
             latency_ms=llm_resp.latency_ms,
         )
     finally:
         if owns_client:
             client.close()
+
+    model_actual = (
+        prev_model_actual if config.eval.judge_model else llm_resp.model_actual
+    )
 
     meta = Meta(
         tool="aitest",
@@ -126,11 +137,13 @@ def evaluate_test_suite(
         generated_at=utc_now_iso(),
         target_file=_display_rel_path(validated_target, root_dir),
         test_file=_display_rel_path(resolved_test, root_dir),
-        provider="ollama",
-        base_url=config.base_url,
-        model_requested=config.model,
-        model_actual=llm_resp.model_actual,
-        model_digest=llm_resp.model_digest,
+        provider="antigravity",
+        model_requested=config.effective_model_label,
+        model_actual=model_actual,
+        judge_model_requested=judge_model_requested,
+        judge_model_actual=llm_resp.model_actual,
+        vertex=config.llm.vertex,
+        conversation_id=llm_resp.conversation_id,
         config_hash=compute_config_hash(config),
         run_id=effective_run_id,
     )
@@ -143,5 +156,4 @@ def evaluate_test_suite(
         weights=config.eval.rubric.to_dict(),
         threshold_pass=config.eval.threshold_pass,
         correctness_cap_offset=config.eval.correctness_cap_offset,
-        require_mutation_for_comparable_report=config.eval.require_mutation_for_comparable_report,
     )

@@ -12,7 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from aitest.analyzer import analyze_test_file
+from aitest.analyzer import analyze_test_file, extract_explicit_raise_lines
 from aitest.config import AitestConfig
 from aitest.mutation import run_mutation_testing
 from aitest.progress import NullProgressReporter, ProgressReporter
@@ -89,28 +89,28 @@ def parse_pytest_summary(output: str, exit_code: int) -> tuple[int, int, int, in
     return passed, failed, skipped, errors
 
 
-def extract_target_file_coverage(
+def _extract_target_file_coverage_full(
     cov_json_path: Path | str,
     target_file: Path | str,
     *,
     include_branch: bool = False,
-) -> tuple[float | None, float | None, list[int]]:
-    """Đọc file JSON của pytest-cov và lọc đúng entry của file nguồn mục tiêu `<file.py>` (FR-03, AC-05).
+) -> tuple[float | None, float | None, list[int], list[int]]:
+    """Đọc file JSON của pytest-cov và lọc đúng entry của file nguồn mục tiêu `<file.py>`.
 
-    Tuyệt đối không lấy tổng `totals` bao gồm cả file test.
+    Trả về `(line_coverage_pct, branch_coverage_pct, missing_lines, executed_lines)`.
     """
     c_path = Path(cov_json_path)
     if not c_path.is_file():
-        return None, None, []
+        return None, None, [], []
 
     try:
         data = json.loads(c_path.read_text(encoding="utf-8"))
     except Exception:
-        return None, None, []
+        return None, None, [], []
 
     files_map = data.get("files", {})
     if not isinstance(files_map, dict):
-        return None, None, []
+        return None, None, [], []
 
     target_norm = os.path.normcase(os.path.abspath(str(target_file)))
     target_name = Path(target_file).name.lower()
@@ -130,11 +130,11 @@ def extract_target_file_coverage(
                 break
 
     if not isinstance(matched_entry, dict):
-        return None, None, []
+        return None, None, [], []
 
     summary = matched_entry.get("summary", {})
     if not isinstance(summary, dict):
-        return None, None, []
+        return None, None, [], []
 
     num_statements = int(summary.get("num_statements", 0))
     covered_lines = int(summary.get("covered_lines", 0))
@@ -160,7 +160,53 @@ def extract_target_file_coverage(
         if isinstance(missing_lines_raw, list)
         else []
     )
+    executed_lines_raw = matched_entry.get("executed_lines", [])
+    executed_lines = (
+        sorted(int(x) for x in executed_lines_raw if isinstance(x, int))
+        if isinstance(executed_lines_raw, list)
+        else []
+    )
+    return line_cov, branch_cov, missing_lines, executed_lines
+
+
+def extract_target_file_coverage(
+    cov_json_path: Path | str,
+    target_file: Path | str,
+    *,
+    include_branch: bool = False,
+) -> tuple[float | None, float | None, list[int]]:
+    """Đọc file JSON của pytest-cov và lọc đúng entry của file nguồn mục tiêu `<file.py>` (FR-03, AC-05).
+
+    Tuyệt đối không lấy tổng `totals` bao gồm cả file test.
+    """
+    line_cov, branch_cov, missing_lines, _ = _extract_target_file_coverage_full(
+        cov_json_path,
+        target_file,
+        include_branch=include_branch,
+    )
     return line_cov, branch_cov, missing_lines
+
+
+def _is_explicit_raise_at_frame(
+    combined_output: str,
+    target_path: Path,
+    last_lineno: int,
+) -> bool:
+    """Kiểm tra xem frame cuối tại `target_path:last_lineno` có phải lệnh `raise` tường minh của mã nguồn không."""
+    if target_path.is_file():
+        try:
+            raise_lines = extract_explicit_raise_lines(
+                target_path.read_text(encoding="utf-8")
+            )
+            if last_lineno in raise_lines:
+                return True
+        except OSError:
+            pass
+
+    pattern = re.compile(
+        rf"{re.escape(target_path.name)}:{last_lineno}:[^\r\n]*\r?\n\s*raise\b"
+    )
+    return bool(pattern.search(combined_output))
 
 
 def classify_pytest_error(
@@ -233,12 +279,18 @@ def classify_pytest_error(
     )
     if tb_frames:
         last_frame_file = Path(tb_frames[-1][0]).name.lower()
+        last_lineno = int(tb_frames[-1][1])
         target_name_low = target_path.name.lower()
         test_name_low = test_path.name.lower()
 
         if last_frame_file == target_name_low and internal_exc_match:
             exc_name = internal_exc_match.group(1)
             exc_msg = internal_exc_match.group(2).strip()
+            if _is_explicit_raise_at_frame(combined, target_path, last_lineno):
+                return (
+                    ErrorCategory.TEST_FAILURE,
+                    f"Hàm test kích hoạt ngoại lệ nghiệp vụ tường minh từ '{target_path.name}' dòng {last_lineno} ({exc_name}: {exc_msg})",
+                )
             return (
                 ErrorCategory.SOURCE_ERROR,
                 f"Lỗi nội tại phát sinh từ file mã nguồn '{target_path.name}' ({exc_name}: {exc_msg})",
@@ -259,6 +311,11 @@ def classify_pytest_error(
                 )
             )
             if last_frame_file == target_name_low and not is_call_signature_mismatch:
+                if _is_explicit_raise_at_frame(combined, target_path, last_lineno):
+                    return (
+                        ErrorCategory.TEST_FAILURE,
+                        f"Hàm test kích hoạt TypeError tường minh từ '{target_path.name}' dòng {last_lineno}: {err_msg}",
+                    )
                 return (
                     ErrorCategory.SOURCE_ERROR,
                     f"TypeError nội tại trong file mã nguồn '{target_path.name}': {err_msg}",
@@ -303,7 +360,9 @@ def run_tests(
     resolved_test = (
         Path(test_file)
         if test_file is not None
-        else resolve_test_file_path(validated_target, config.paths.tests_dir)
+        else resolve_test_file_path(
+            validated_target, config.paths.tests_dir, project_root=root_dir
+        )
     )
     if not resolved_test.is_absolute():
         resolved_test = root_dir / resolved_test
@@ -423,9 +482,10 @@ def run_tests(
     line_cov: float | None = None
     branch_cov: float | None = None
     missing_lines: list[int] = []
+    executed_lines: list[int] = []
     try:
         if use_cov and not timed_out:
-            line_cov, branch_cov, missing_lines = extract_target_file_coverage(
+            line_cov, branch_cov, missing_lines, executed_lines = _extract_target_file_coverage_full(
                 tmp_cov_path,
                 validated_target,
                 include_branch=config.coverage.branch,
@@ -469,6 +529,7 @@ def run_tests(
             test_file=resolved_test,
             config=config,
             project_root=root_dir,
+            executed_lines=(set(executed_lines) if executed_lines else None),
             reporter=rep,
         )
 
@@ -488,6 +549,7 @@ def run_tests(
         line_coverage_pct=line_cov,
         branch_coverage_pct=branch_cov,
         missing_lines=missing_lines,
+        executed_lines=executed_lines,
         test_count=test_count,
         error_category=error_cat,
         error_detail=error_detail,

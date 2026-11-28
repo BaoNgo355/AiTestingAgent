@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import ast
 import difflib
+import re
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from aitest.analyzer import analyze_test_code
 from aitest.config import AitestConfig
-from aitest.context import build_fix_prompts
-from aitest.llm.client import OllamaClient
+from aitest.context import build_fix_prompts, build_targeted_fix_prompts
+from aitest.llm.client import AntigravityClient
 from aitest.progress import NullProgressReporter, ProgressReporter
 from aitest.quality_guard import check_quality_guard
 from aitest.runner import run_tests
@@ -53,11 +55,180 @@ class FixResult(BaseModel):
     iterations_run: int = 0
     stop_reason: str
     initial_error_category: ErrorCategory = ErrorCategory.NONE
+    initial_run_result: RunResult | None = None
     final_run_result: RunResult
     last_guard_result: GuardResult | None = None
     assertion_diffs: list[AssertionDiffEntry] = Field(default_factory=list)
     diff_preview: str = ""
     records: list[FixIterationRecord] = Field(default_factory=list)
+
+
+_FAILED_NODEID_RE = re.compile(r"^FAILED\s+\S+?::([^\s\[]+)", re.MULTILINE)
+_FAILURE_HEADER_RE = re.compile(r"^_{3,}\s+(?:(?:[\w.]+\.)?(test_[^\s\[]+)(?:\[[^\]]*\])?)\s+_{3,}$", re.MULTILINE)
+
+
+def extract_failing_test_names(pytest_output: str) -> list[str]:
+    """Trích xuất danh sách tên hàm `test_*` bị fail từ output của `pytest`."""
+    names: list[str] = []
+
+    def _add(raw_name: str) -> None:
+        cleaned = raw_name.split("[", 1)[0].replace("::", ".").strip()
+        if cleaned and cleaned not in names:
+            names.append(cleaned)
+
+    for m in _FAILED_NODEID_RE.finditer(pytest_output):
+        _add(m.group(1))
+    for m in _FAILURE_HEADER_RE.finditer(pytest_output):
+        _add(m.group(1))
+    return names
+
+
+def _node_span(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[int, int]:
+    """Trả về `(start_lineno, end_lineno)` 1-based bao gồm cả các decorator phía trên hàm."""
+    dec_lines = [getattr(d, "lineno", node.lineno) for d in node.decorator_list]
+    start_line = min([node.lineno, *dec_lines])
+    end_line = getattr(node, "end_lineno", None) or node.lineno
+    return start_line, end_line
+
+
+def _extract_targeted_test_context(
+    test_code: str,
+    failing_names: list[str],
+) -> tuple[str, str, list[str]] | None:
+    """Trích xuất phần header (imports, fixtures, helpers) và mã nguồn của các hàm đang fail.
+
+    Trả về `(header_context, failing_tests_code, matched_names)` hoặc `None` nếu không tách được an toàn.
+    """
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError:
+        return None
+
+    target_set = set(failing_names)
+    lines = test_code.splitlines()
+    header_parts: list[str] = []
+    failing_parts: list[str] = []
+    matched_names: list[str] = []
+
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            src = ast.unparse(node).strip()
+            if src:
+                header_parts.append(src)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in target_set:
+                s_ln, e_ln = _node_span(node)
+                failing_parts.append("\n".join(lines[s_ln - 1 : e_ln]))
+                matched_names.append(node.name)
+            elif not node.name.startswith("test_"):
+                src = ast.unparse(node).strip()
+                if src:
+                    header_parts.append(src)
+        elif isinstance(node, ast.ClassDef) and not node.name.startswith("Test"):
+            src = ast.unparse(node).strip()
+            if src:
+                header_parts.append(src)
+
+    if not failing_parts:
+        return None
+
+    return "\n\n".join(header_parts), "\n\n".join(failing_parts), matched_names
+
+
+def splice_fixed_test_functions(
+    original_test_code: str,
+    llm_patch_code: str,
+    target_names: set[str],
+) -> str:
+    """Ghép các hàm `test_*` đã được LLM sửa vào đúng vị trí trong `original_test_code`.
+
+    Giữ nguyên 100% các hàm test đang pass, fixtures và helpers hiện có; đồng thời hợp nhất
+    các câu lệnh import mới nếu LLM có bổ sung (ví dụ `import math`).
+    """
+    try:
+        orig_tree = ast.parse(original_test_code)
+        patch_tree = ast.parse(llm_patch_code)
+    except SyntaxError:
+        return llm_patch_code
+
+    orig_imports = {
+        ast.unparse(n).strip()
+        for n in orig_tree.body
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+    }
+    new_imports: list[str] = []
+    last_import_end = 0
+    for n in orig_tree.body:
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            last_import_end = max(last_import_end, getattr(n, "end_lineno", n.lineno))
+
+    for n in patch_tree.body:
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            imp_src = ast.unparse(n).strip()
+            if imp_src and imp_src not in orig_imports and imp_src not in new_imports:
+                new_imports.append(imp_src)
+
+    # Thu thập các hàm thay thế từ patch của LLM (cấp module và method trong class Test*)
+    patch_funcs: dict[str, str] = {}
+    patch_lines = llm_patch_code.splitlines()
+    for n in patch_tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_"):
+            ps, pe = _node_span(n)
+            patch_funcs[n.name] = "\n".join(patch_lines[ps - 1 : pe])
+        elif isinstance(n, ast.ClassDef) and n.name.startswith("Test"):
+            for item in n.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test_"):
+                    qname = f"{n.name}.{item.name}"
+                    patch_funcs[qname] = ast.unparse(item).strip()
+
+    # Áp dụng thay thế ngược từ cuối file lên đầu để không làm lệch chỉ số dòng
+    target_set = set(target_names)
+    lines = original_test_code.splitlines()
+    replacements: list[tuple[int, int, str]] = []
+    replaced_names: set[str] = set()
+
+    for n in orig_tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in target_set:
+            if n.name in patch_funcs:
+                s_ln, e_ln = _node_span(n)
+                replacements.append((s_ln, e_ln, patch_funcs[n.name]))
+                replaced_names.add(n.name)
+        elif isinstance(n, ast.ClassDef) and n.name.startswith("Test"):
+            for item in n.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    qname = f"{n.name}.{item.name}"
+                    if qname in target_set and qname in patch_funcs:
+                        s_ln, e_ln = _node_span(item)
+                        indent = " " * item.col_offset
+                        indented = "\n".join(
+                            (f"{indent}{ln}" if ln.strip() else "")
+                            for ln in patch_funcs[qname].splitlines()
+                        )
+                        replacements.append((s_ln, e_ln, indented))
+                        replaced_names.add(qname)
+
+    for s_ln, e_ln, replacement_block in sorted(replacements, key=lambda r: r[0], reverse=True):
+        lines[s_ln - 1 : e_ln] = replacement_block.splitlines()
+
+    if new_imports:
+        insert_idx = last_import_end
+        lines[insert_idx:insert_idx] = new_imports
+
+    # Nếu LLM sinh thêm hàm test mới ngoài danh sách hàm cũ, nối thêm vào cuối file
+    orig_test_names = {
+        n.name
+        for n in orig_tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
+    }
+    extra_blocks = [
+        src
+        for fname, src in patch_funcs.items()
+        if "." not in fname and fname not in orig_test_names and fname not in replaced_names
+    ]
+    result = "\n".join(lines).rstrip() + "\n"
+    if extra_blocks:
+        result += "\n\n" + "\n\n".join(extra_blocks) + "\n"
+    return result
 
 
 def _make_unified_diff(old_text: str, new_text: str, filename: str) -> str:
@@ -90,7 +261,7 @@ def fix_test_file(
     dry_run: bool = False,
     initial_run_result: RunResult | None = None,
     baseline_mutation_score: float | None = None,
-    llm_client: OllamaClient | None = None,
+    llm_client: AntigravityClient | None = None,
     run_id: str | None = None,
     project_root: Path | str | None = None,
     reporter: ProgressReporter | None = None,
@@ -113,7 +284,9 @@ def fix_test_file(
     resolved_test = (
         Path(test_file)
         if test_file is not None
-        else resolve_test_file_path(validated_target, config.paths.tests_dir)
+        else resolve_test_file_path(
+            validated_target, config.paths.tests_dir, project_root=root_dir
+        )
     )
     if not resolved_test.is_absolute():
         resolved_test = root_dir / resolved_test
@@ -134,6 +307,7 @@ def fix_test_file(
         enable_mutation=False,
         reporter=rep,
     )
+    initial_snapshot = curr_run
 
     if curr_run.all_tests_passed:
         return FixResult(
@@ -144,6 +318,7 @@ def fix_test_file(
             iterations_run=0,
             stop_reason="already_passed",
             initial_error_category=ErrorCategory.NONE,
+            initial_run_result=initial_snapshot,
             final_run_result=curr_run,
         )
 
@@ -157,12 +332,13 @@ def fix_test_file(
             iterations_run=0,
             stop_reason=f"unfixable_error:{initial_cat.value}",
             initial_error_category=initial_cat,
+            initial_run_result=initial_snapshot,
             final_run_result=curr_run,
         )
 
     source_code = validated_target.read_text(encoding="utf-8")
     owns_client = llm_client is None
-    client = llm_client or OllamaClient(config)
+    client = llm_client or AntigravityClient(config)
 
     records: list[FixIterationRecord] = []
     collected_diffs: list[AssertionDiffEntry] = []
@@ -189,29 +365,68 @@ def fix_test_file(
             if extra_feedback:
                 pytest_output = f"{pytest_output}\n\n[Previous Fix Attempt Rejected by Quality Guard]:\n{extra_feedback}"
 
-            sys_prompt, usr_prompt = build_fix_prompts(
-                target_file=validated_target,
-                test_file=resolved_test,
-                source_code=source_code,
-                current_test_code=current_test_code,
-                pytest_output=pytest_output,
-                error_category=curr_run.error_category,
-                project_root=root_dir,
-            )
+            # Ưu tiên Targeted Function-level Fix khi lỗi là TEST_FAILURE và chỉ một phần hàm bị fail
+            targeted_ctx: tuple[str, str, list[str]] | None = None
+            use_targeted = False
+            if curr_run.error_category == ErrorCategory.TEST_FAILURE:
+                try:
+                    t_analysis = analyze_test_code(current_test_code, file_path=resolved_test)
+                    failing_names = extract_failing_test_names(pytest_output)
+                    matched_failing = [fn for fn in failing_names if fn in set(t_analysis.test_names)]
+                    if 0 < len(matched_failing) < t_analysis.test_count:
+                        targeted_ctx = _extract_targeted_test_context(current_test_code, matched_failing)
+                        if targeted_ctx is not None:
+                            use_targeted = True
+                except SyntaxError:
+                    use_targeted = False
+
+            if use_targeted and targeted_ctx is not None:
+                header_ctx, failing_code, matched_failing_names = targeted_ctx
+                sys_prompt, usr_prompt = build_targeted_fix_prompts(
+                    target_file=validated_target,
+                    test_file=resolved_test,
+                    source_code=source_code,
+                    header_context=header_ctx,
+                    failing_tests_code=failing_code,
+                    failing_test_names=matched_failing_names,
+                    pytest_output=pytest_output,
+                    error_category=curr_run.error_category,
+                    project_root=root_dir,
+                )
+            else:
+                sys_prompt, usr_prompt = build_fix_prompts(
+                    target_file=validated_target,
+                    test_file=resolved_test,
+                    source_code=source_code,
+                    current_test_code=current_test_code,
+                    pytest_output=pytest_output,
+                    error_category=curr_run.error_category,
+                    project_root=root_dir,
+                )
 
             with rep.step(
-                f"[Fix {iter_idx}/{effective_max_iters}] Đang gọi Ollama ({config.model}) sửa lỗi {curr_run.error_category.value}",
-                done_message=f"[Fix {iter_idx}/{effective_max_iters}] Ollama đã trả về bản sửa cho '{resolved_test.name}'",
+                f"[Fix {iter_idx}/{effective_max_iters}] Đang gọi Antigravity ({config.effective_model_label}) sửa lỗi {curr_run.error_category.value}",
+                done_message=f"[Fix {iter_idx}/{effective_max_iters}] Antigravity đã trả về bản sửa cho '{resolved_test.name}'",
             ):
                 llm_resp = client.chat(system_prompt=sys_prompt, user_prompt=usr_prompt)
             rep.on_llm_call_end(
                 task_name=f"fix#{iter_idx}",
-                model=llm_resp.model_actual or config.model,
+                model=llm_resp.model_actual or config.effective_model_label,
                 prompt_tokens=llm_resp.prompt_tokens,
                 completion_tokens=llm_resp.completion_tokens,
+                thinking_tokens=llm_resp.thinking_tokens,
                 latency_ms=llm_resp.latency_ms,
             )
-            candidate_code = ensure_pytest_imported(sanitize_code_block(llm_resp.content))
+            cleaned_patch = sanitize_code_block(llm_resp.content)
+            if use_targeted and targeted_ctx is not None:
+                spliced = splice_fixed_test_functions(
+                    current_test_code,
+                    cleaned_patch,
+                    set(targeted_ctx[2]),
+                )
+                candidate_code = ensure_pytest_imported(spliced)
+            else:
+                candidate_code = ensure_pytest_imported(cleaned_patch)
 
             if not dry_run and _is_same_ast(current_test_code, candidate_code):
                 no_change_msg = (
@@ -388,6 +603,7 @@ def fix_test_file(
         iterations_run=len(records),
         stop_reason=stop_reason,
         initial_error_category=initial_cat,
+        initial_run_result=initial_snapshot,
         final_run_result=curr_run,
         last_guard_result=last_guard,
         assertion_diffs=collected_diffs,

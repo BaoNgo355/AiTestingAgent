@@ -121,3 +121,53 @@ def test_divide():
     res3 = check_quality_guard(BASE_TEST_CODE, added_skip_code)
     assert res3.passed is False
     assert len(res3.added_skips) == 1
+
+
+def test_quality_guard_allows_float_approx_bool_norm_match_and_smart_alignment() -> None:
+    """Kiểm tra P0.2:
+    - Cho phép `math.isclose`, `abs(a - b) < 1e-6`, `== True` -> `is True`, `pytest.raises(..., match=...)`.
+    - Chèn thêm `assert` mới phía trước `with pytest.raises(...)` không gây lệch index.
+    - Vẫn chặn `abs(a - b) < 1.0` (dung sai quá lớn).
+    """
+    old_code = """\
+import pytest
+from calculator import weighted_average, is_prime, divide
+
+def test_float_and_bool():
+    assert weighted_average([1, 2, 3], [1, 2, 3]) == 2.0
+    assert weighted_average([10, 20, 30], [0.5, 0.3, 0.2]) == 17.0
+    assert is_prime(2) == True
+    with pytest.raises(ValueError) as exc_info:
+        divide(1, 0)
+    assert str(exc_info.value) == "Cannot divide by zero"
+"""
+    good_new_code = """\
+import math
+import pytest
+from calculator import weighted_average, is_prime, divide
+
+def test_float_and_bool():
+    assert is_prime(3) is True
+    assert math.isclose(weighted_average([1, 2, 3], [1, 2, 3]), 2.3333333, rel_tol=1e-6)
+    assert abs(weighted_average([10, 20, 30], [0.5, 0.3, 0.2]) - 17.0) < 1e-6
+    assert is_prime(2) is True
+    with pytest.raises(ValueError, match="Cannot divide by zero"):
+        divide(1, 0)
+"""
+    res_ok = check_quality_guard(old_code, good_new_code)
+    assert res_ok.passed is True, f"Unexpected rejection: {res_ok.reasons}"
+
+    loose_tol_code = """\
+import pytest
+from calculator import weighted_average, is_prime, divide
+
+def test_float_and_bool():
+    assert abs(weighted_average([1, 2, 3], [1, 2, 3]) - 2.33) < 0.5
+    assert weighted_average([10, 20, 30], [0.5, 0.3, 0.2]) == 17.0
+    assert is_prime(2) == True
+    with pytest.raises(ValueError) as exc_info:
+        divide(1, 0)
+    assert str(exc_info.value) == "Cannot divide by zero"
+"""
+    res_bad = check_quality_guard(old_code, loose_tol_code)
+    assert res_bad.passed is False

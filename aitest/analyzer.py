@@ -94,6 +94,7 @@ class AssertionInfo(BaseModel):
     source: str
     ast_dump: str
     raised_exception: str | None = None
+    has_match: bool = False
 
 
 from typing import Literal
@@ -376,6 +377,24 @@ def analyze_source_code(
     )
 
 
+def extract_explicit_raise_lines(source_code: str) -> set[int]:
+    """Trả về tập các số dòng chứa lệnh `raise` tường minh trong file mã nguồn."""
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return set()
+
+    raise_lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise):
+            start = getattr(node, "lineno", None)
+            end = getattr(node, "end_lineno", None) or start
+            if start is not None:
+                for ln in range(start, (end or start) + 1):
+                    raise_lines.add(ln)
+    return raise_lines
+
+
 def analyze_source_file(
     file_path: Path | str,
     project_root: Path | str | None = None,
@@ -421,6 +440,18 @@ def _is_pytest_raises_call(node: ast.AST) -> str | None:
             return _unparse_safe(node.args[0]) or "Exception"
         return "Exception"
     return None
+
+
+def _has_nonempty_match_kwarg(node: ast.AST) -> bool:
+    """Kiểm tra xem `pytest.raises(...)` có truyền tham số `match=...` khác rỗng không."""
+    if not isinstance(node, ast.Call):
+        return False
+    for kw in node.keywords:
+        if kw.arg == "match":
+            if isinstance(kw.value, ast.Constant):
+                return kw.value.value not in (None, "")
+            return True
+    return False
 
 
 def _is_fixture_decorator(dec: ast.AST) -> bool:
@@ -479,6 +510,7 @@ def _extract_assertions_from_test(
                             source=f"with {src}",
                             ast_dump=ast.dump(item.context_expr, include_attributes=False),
                             raised_exception=exc_type,
+                            has_match=_has_nonempty_match_kwarg(item.context_expr),
                         )
                     )
         elif isinstance(sub, ast.Call):
@@ -493,6 +525,7 @@ def _extract_assertions_from_test(
                         source=src,
                         ast_dump=ast.dump(sub, include_attributes=False),
                         raised_exception=exc_type,
+                        has_match=_has_nonempty_match_kwarg(sub),
                     )
                 )
 

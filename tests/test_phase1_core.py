@@ -32,35 +32,36 @@ from aitest.utils import (
 
 
 def test_config_priority_and_env_override(tmp_path: Path) -> None:
-    """Kiểm tra thứ tự ưu tiên: CLI flags > AITEST_* env > aitest.yaml > defaults."""
+    """Kiểm tra thứ tự ưu tiên: CLI flags > AITEST_* / GEMINI_API_KEY > aitest.yaml > defaults."""
     yaml_file = tmp_path / "aitest.yaml"
     yaml_file.write_text(
-        "model: codellama:7b\nllm:\n  temperature: 0.5\n",
+        "model: gemini-3.8-pro\nllm:\n  vertex: false\n",
         encoding="utf-8",
     )
 
     env = {
-        "OLLAMA_BASE_URL": "http://127.0.0.1:11435/",
-        "OLLAMA_API_KEY": "super-secret-key",
-        "AITEST_LLM__TEMPERATURE": "0.1",
+        "GEMINI_API_KEY": "secret-key-abc",
+        "AITEST_LLM__VERTEX": "true",
+        "GOOGLE_CLOUD_PROJECT": "proj-env",
+        "GOOGLE_CLOUD_LOCATION": "us-central1",
         "AITEST_EVAL__THRESHOLD_PASS": "8.5",
     }
     cli_overrides = {
-        "model": "qwen2.5-coder:14b",
+        "model": "gemini-3.8-flash",
     }
 
     cfg = load_config(config_path=yaml_file, cli_overrides=cli_overrides, env=env)
-    assert cfg.model == "qwen2.5-coder:14b"  # từ CLI
-    assert cfg.llm.temperature == 0.1  # từ AITEST_LLM__TEMPERATURE
+    assert cfg.provider == "antigravity"
+    assert cfg.model == "gemini-3.8-flash"  # từ CLI
+    assert cfg.llm.vertex is True  # từ AITEST_LLM__VERTEX
+    assert cfg.llm.api_key == "secret-key-abc"  # từ GEMINI_API_KEY
+    assert cfg.llm.project == "proj-env"
+    assert cfg.llm.location == "us-central1"
     assert cfg.eval.threshold_pass == 8.5  # từ AITEST_EVAL__THRESHOLD_PASS
-    assert cfg.base_url == "http://127.0.0.1:11435"  # chuẩn hóa bỏ dấu /
-    assert cfg.ollama_api_key is not None
-    assert cfg.ollama_api_key.get_secret_value() == "super-secret-key"
 
-    # Bảo mật NFR-03: không bao giờ lộ ollama_api_key trong safe_dump hoặc config_hash
     dumped = cfg.safe_dump()
-    assert "ollama_api_key" not in dumped
-    assert "super-secret-key" not in str(dumped)
+    assert dumped["provider"] == "antigravity"
+    assert "api_key" not in dumped["llm"]
     cfg_hash = compute_config_hash(cfg)
     assert cfg_hash.startswith("sha256:")
 
@@ -74,14 +75,15 @@ def test_rubric_weights_sum_validation() -> None:
 def test_eval_report_reference_example_ac19() -> None:
     """Kiểm tra AC-09, AC-10, AC-11, AC-19 khớp ví dụ chuẩn trong SRS §8.2 (8.4175 -> 8.42)."""
     meta = Meta(
-        version="2.3.0",
-        generated_at="2026-11-20T14:00:00Z",
+        version="4.0.0",
+        generated_at="2026-11-28T14:00:00Z",
         target_file="examples/calculator.py",
         test_file="tests/test_calculator.py",
-        base_url="http://localhost:11434",
-        model_requested="qwen2.5-coder:7b",
-        model_actual="qwen2.5-coder:7b",
-        model_digest="sha256:2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730",
+        model_requested="gemini-3.8-flash",
+        model_actual="gemini-3.8-flash",
+        judge_model_requested="gemini-3.8-flash",
+        judge_model_actual="gemini-3.8-flash",
+        conversation_id="conv-ac19",
         config_hash="sha256:8f9d2a1b3c4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a",
         run_id="550e8400-e29b-41d4-a716-446655440000",
     )
@@ -176,12 +178,11 @@ def test_correctness_cap_and_no_valid_mutants_ac11_ac20_ac21_ac22_ac23() -> None
 
     # AC-22 & AC-23: mutation_status = no_valid_mutants
     meta = Meta(
-        version="2.3.0",
-        generated_at="2026-11-20T14:00:00Z",
+        version="4.0.0",
+        generated_at="2026-11-28T14:00:00Z",
         target_file="examples/empty.py",
         test_file="tests/test_empty.py",
-        base_url="http://localhost:11434",
-        model_requested="qwen2.5-coder:7b",
+        model_requested="gemini-3.8-flash",
         config_hash="sha256:abc",
         run_id="run-123",
     )

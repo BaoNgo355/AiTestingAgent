@@ -1,4 +1,4 @@
-"""Định nghĩa toàn bộ Pydantic v2 schemas cho aitest theo SRS v2.3.0 §8."""
+"""Định nghĩa toàn bộ Pydantic v2 schemas cho aitest theo SRS v3.0.0 §8."""
 
 from __future__ import annotations
 
@@ -57,11 +57,13 @@ class Meta(BaseModel):
     generated_at: str
     target_file: str
     test_file: str
-    provider: Literal["ollama"] = "ollama"
-    base_url: str
+    provider: Literal["antigravity"] = "antigravity"
     model_requested: str
     model_actual: str | None = None
-    model_digest: str | None = None
+    judge_model_requested: str | None = None
+    judge_model_actual: str | None = None
+    vertex: bool = False
+    conversation_id: str | None = None
     config_hash: str
     run_id: str
 
@@ -110,6 +112,7 @@ class ObjectiveMetrics(BaseModel):
     mutation_available: bool
     mutation_unavailable_reason: str | None = None
     test_count: int = Field(ge=0)
+    missing_lines: list[int] = Field(default_factory=list)
     survived_mutants: list[SurvivedMutant] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -281,7 +284,6 @@ def build_eval_report(
     weights: dict[str, float],
     threshold_pass: float = 8.0,
     correctness_cap_offset: float = 2.0,
-    require_mutation_for_comparable_report: bool = True,
 ) -> EvalReport:
     """Tính toán toàn bộ trường có thẩm quyền từ chương trình và đóng gói EvalReport (FR-05 & §8.1).
 
@@ -343,7 +345,7 @@ def build_eval_report(
 
     # Xác định report_comparable và non_comparable_reason
     reasons: list[str] = []
-    if not objective_metrics.mutation_available and require_mutation_for_comparable_report:
+    if not objective_metrics.mutation_available:
         detail = objective_metrics.mutation_unavailable_reason or (
             f"mutation_status={objective_metrics.mutation_status}"
         )
@@ -431,6 +433,7 @@ class RunResult(BaseModel):
     line_coverage_pct: float | None = Field(default=None, ge=0.0, le=100.0)
     branch_coverage_pct: float | None = Field(default=None, ge=0.0, le=100.0)
     missing_lines: list[int] = Field(default_factory=list)
+    executed_lines: list[int] = Field(default_factory=list)
     test_count: int = Field(default=0, ge=0)
     error_category: ErrorCategory = ErrorCategory.NONE
     error_detail: str | None = None
@@ -464,6 +467,7 @@ class RunResult(BaseModel):
             mutation_available=mut.mutation_available,
             mutation_unavailable_reason=mut.mutation_unavailable_reason,
             test_count=self.test_count,
+            missing_lines=list(self.missing_lines),
             survived_mutants=mut.survived_mutants,
         )
 

@@ -3,54 +3,47 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
-import httpx
-
-from aitest.config import AitestConfig
+from aitest.config import SDK_DEFAULT_MODEL, AitestConfig
 from aitest.evaluator import evaluate_test_suite
-from aitest.llm.client import OllamaClient
+from aitest.llm.client import AntigravityClient, SDKCallSpec, SDKTurnResult
 from aitest.schemas import MutationResult, RunResult, SurvivedMutant
 
 
-def _make_mock_ollama_client(cfg: AitestConfig, correctness_score: float = 9.5) -> OllamaClient:
-    assessment_payload = json.dumps(
-        {
-            "correctness": correctness_score,
-            "readability": 9.0,
-            "maintainability": 8.5,
-            "isolation": 9.0,
-            "robustness": 8.0,
-            "determinism": 9.0,
-            "issues": [],
-            "summary": "Đánh giá thử nghiệm.",
-        }
-    )
+def _make_mock_antigravity_client(
+    cfg: AitestConfig,
+    tmp_path: Path,
+    correctness_score: float = 9.5,
+) -> AntigravityClient:
+    cfg.llm.api_key = "test-api-key"
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/tags":
-            return httpx.Response(
-                200,
-                json={
-                    "models": [
-                        {
-                            "name": cfg.model,
-                            "digest": "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
-                        }
-                    ]
-                },
-            )
-        return httpx.Response(
-            200,
-            json={
-                "model": cfg.model,
-                "message": {"role": "assistant", "content": assessment_payload},
-                "prompt_eval_count": 200,
-                "eval_count": 80,
-            },
+    assessment_obj = {
+        "correctness": correctness_score,
+        "readability": 9.0,
+        "maintainability": 8.5,
+        "isolation": 9.0,
+        "robustness": 8.0,
+        "determinism": 9.0,
+        "issues": [],
+        "summary": "Đánh giá thử nghiệm.",
+    }
+    assessment_payload = json.dumps(assessment_obj)
+
+    def runner(spec: SDKCallSpec) -> SDKTurnResult:
+        return SDKTurnResult(
+            text=assessment_payload,
+            structured_output=assessment_obj,
+            model_actual=spec.model or SDK_DEFAULT_MODEL,
+            conversation_id="conv-eval-1",
+            prompt_tokens=200,
+            completion_tokens=80,
+            thinking_tokens=10,
+            total_tokens=290,
         )
 
-    return OllamaClient(cfg, transport=httpx.MockTransport(handler), backoff_base_sec=0.0)
+    return AntigravityClient(cfg, sdk_runner=runner, backoff_base_sec=0.0)
 
 
 def test_evaluator_applies_correctness_cap_when_mutation_available_ac11(tmp_path: Path) -> None:
@@ -86,7 +79,7 @@ def test_evaluator_applies_correctness_cap_when_mutation_available_ac11(tmp_path
     )
 
     cfg = AitestConfig()
-    client = _make_mock_ollama_client(cfg, correctness_score=9.5)
+    client = _make_mock_antigravity_client(cfg, tmp_path, correctness_score=9.5)
     report = evaluate_test_suite(
         target_file=src_file,
         config=cfg,
@@ -96,6 +89,8 @@ def test_evaluator_applies_correctness_cap_when_mutation_available_ac11(tmp_path
         project_root=tmp_path,
     )
 
+    assert report.meta.provider == "antigravity"
+    assert report.meta.conversation_id == "conv-eval-1"
     assert report.correctness_cap_applied is True
     assert report.llm_assessment.correctness == 9.5
     assert report.scores["mutation"] == 5.0
@@ -132,7 +127,7 @@ def test_evaluator_when_mutation_disabled_marks_non_comparable_and_renormalizes_
     )
 
     cfg = AitestConfig()
-    client = _make_mock_ollama_client(cfg, correctness_score=9.5)
+    client = _make_mock_antigravity_client(cfg, tmp_path, correctness_score=9.5)
     report = evaluate_test_suite(
         target_file=src_file,
         config=cfg,

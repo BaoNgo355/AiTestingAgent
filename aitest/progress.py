@@ -3,7 +3,7 @@
 Thiết kế:
 - Tách biệt hoàn toàn giao diện tiến độ khỏi core logic thông qua `ProgressReporter`.
 - Hỗ trợ 3 mức độ:
-  * Mặc định (Normal): Spinner kèm đồng hồ đếm giây khi gọi Ollama/pytest, thanh Progress Bar
+  * Mặc định (Normal): Spinner kèm đồng hồ đếm giây khi gọi Antigravity/pytest, thanh Progress Bar
     (`i/N`, `%`, `Killed/Survived`) khi chạy Mutation Testing, in cảnh báo khi có mutant SURVIVED,
     và in dòng tóm tắt chỉ số sau mỗi vòng Agent Loop.
   * `--verbose`: Hiển thị thêm thống kê token/latency sau mỗi lần gọi LLM và trạng thái của từng mutant.
@@ -63,8 +63,9 @@ class ProgressReporter:
         prompt_tokens: int,
         completion_tokens: int,
         latency_ms: int,
+        thinking_tokens: int = 0,
     ) -> None:
-        """Sự kiện sau mỗi lần gọi Ollama `/api/chat` thành công."""
+        """Sự kiện sau mỗi lần gọi Antigravity Headless thành công."""
 
     def on_mutation_start(self, total_mutants: int, target_file: str) -> None:
         """Sự kiện bắt đầu chạy danh sách mutants."""
@@ -236,13 +237,15 @@ class RichProgressReporter(ProgressReporter):
         prompt_tokens: int,
         completion_tokens: int,
         latency_ms: int,
+        thinking_tokens: int = 0,
     ) -> None:
         if not self.verbose or self.quiet:
             return
-        total_tok = prompt_tokens + completion_tokens
+        total_tok = prompt_tokens + completion_tokens + thinking_tokens
+        think_part = f" + {thinking_tokens} thinking" if thinking_tokens > 0 else ""
         self._print(
             f"  [dim]↳ LLM \\[{task_name}] ({model}): "
-            f"{prompt_tokens} prompt + {completion_tokens} completion = {total_tok} tokens "
+            f"{prompt_tokens} prompt + {completion_tokens} completion{think_part} = {total_tok} tokens "
             f"({latency_ms / 1000.0:.2f}s)[/dim]"
         )
 

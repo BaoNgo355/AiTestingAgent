@@ -1,8 +1,7 @@
-"""Quản lý cấu hình hệ thống aitest theo SRS v2.3.0 §10.
+"""Quản lý cấu hình hệ thống aitest theo SRS v4.0.0 §10.
 
 Thứ tự ưu tiên cấu hình:
-CLI flags > Biến môi trường AITEST_* (dùng __ cho cấp lồng nhau) > aitest.yaml > Defaults.
-Riêng OLLAMA_BASE_URL và OLLAMA_API_KEY cũng được đọc từ biến môi trường hoặc file .env.
+CLI flags > Biến môi trường AITEST_* (dùng __ cho cấp lồng nhau) / GEMINI_API_KEY > aitest.yaml > Defaults.
 """
 
 from __future__ import annotations
@@ -13,14 +12,36 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+SDK_DEFAULT_MODEL = "gemini-3.8-flash"
+OutputFormat = Literal["json", "md", "html"]
+
+
+def normalize_output_format(v: Any) -> OutputFormat:
+    """Chuẩn hóa tên định dạng xuất báo cáo về 'json', 'md' hoặc 'html'."""
+    raw = str(v if v is not None else "json").strip().lower()
+    if raw == "markdown":
+        return "md"
+    if raw == "htm":
+        return "html"
+    if raw == "json":
+        return "json"
+    if raw == "md":
+        return "md"
+    if raw == "html":
+        return "html"
+    raise ValueError(
+        f"Định dạng xuất không hợp lệ ('{v}'). Chỉ hỗ trợ: json, md, html."
+    )
+
 
 DEFAULT_AITEST_YAML_TEMPLATE = """\
-provider: ollama
-base_url: http://localhost:11434
-model: qwen2.5-coder:7b
+provider: antigravity
+model: null                        # null = dùng mặc định của Google Antigravity SDK (gemini-3.8-flash)
 language: python
 test_framework: pytest
+timeout_sec: 120
 
 coverage:
   enabled: true
@@ -46,7 +67,7 @@ eval:
     determinism: 0.07
   threshold_pass: 8.0
   correctness_cap_offset: 2.0
-  require_mutation_for_comparable_report: true
+  judge_model: null                # để null để dùng chung model, hoặc chỉ định model riêng cho bước đánh giá
 
 fix:
   max_iters: 3
@@ -61,26 +82,36 @@ fix:
 agent:
   max_iters: 3
   max_llm_calls: 12
-  max_total_tokens: 200000
+  max_total_tokens: 400000
   max_runtime_sec: 900
   early_stop_patience: 2
 
 llm:
-  temperature: 0.2
-  max_tokens: 4096                 # map sang Ollama options.num_predict
-  num_ctx: 8192                    # context window
-  keep_alive: 5m
+  vertex: false                    # true để dùng Vertex AI (Standard ADC hoặc Express api_key)
+  project: null                    # GCP project ID khi dùng Vertex Standard ADC
+  location: null                   # GCP region (vd: us-central1) khi dùng Vertex Standard ADC
   timeout_sec: 300
   retry: 2
 
 output:
-  format: json
+  format: json                     # json | md | html
   log_dir: .aitest_logs
   backup_dir: .aitest_backup
 
 paths:
   tests_dir: tests
 """
+
+
+def _normalize_nullable_str(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        stripped = v.strip()
+        if not stripped or stripped.lower() in ("null", "none"):
+            return None
+        return stripped
+    return str(v)
 
 
 class CoverageConfig(BaseModel):
@@ -134,7 +165,12 @@ class EvalConfig(BaseModel):
     rubric: RubricWeights = Field(default_factory=RubricWeights)
     threshold_pass: float = Field(default=8.0, ge=0.0, le=10.0)
     correctness_cap_offset: float = Field(default=2.0, ge=0.0, le=10.0)
-    require_mutation_for_comparable_report: bool = True
+    judge_model: str | None = None
+
+    @field_validator("judge_model", mode="before")
+    @classmethod
+    def _clean_judge_model(cls, v: Any) -> str | None:
+        return _normalize_nullable_str(v)
 
 
 class QualityGuardConfig(BaseModel):
@@ -154,24 +190,34 @@ class FixConfig(BaseModel):
 class AgentConfig(BaseModel):
     max_iters: int = Field(default=3, ge=1)
     max_llm_calls: int = Field(default=12, ge=1)
-    max_total_tokens: int = Field(default=200000, ge=1)
+    max_total_tokens: int = Field(default=400000, ge=1)
     max_runtime_sec: int = Field(default=900, ge=1)
     early_stop_patience: int = Field(default=2, ge=1)
 
 
 class LLMConfig(BaseModel):
-    temperature: float = Field(default=0.2, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=4096, ge=1)
-    num_ctx: int = Field(default=8192, ge=512)
-    keep_alive: str = "5m"
+    api_key: str | None = Field(default=None, repr=False)
+    vertex: bool = False
+    project: str | None = None
+    location: str | None = None
     timeout_sec: int = Field(default=300, ge=1)
     retry: int = Field(default=2, ge=0)
 
+    @field_validator("api_key", "project", "location", mode="before")
+    @classmethod
+    def _clean_nullable(cls, v: Any) -> str | None:
+        return _normalize_nullable_str(v)
+
 
 class OutputConfig(BaseModel):
-    format: Literal["json"] = "json"
+    format: OutputFormat = "json"
     log_dir: str = ".aitest_logs"
     backup_dir: str = ".aitest_backup"
+
+    @field_validator("format", mode="before")
+    @classmethod
+    def _clean_format(cls, v: Any) -> OutputFormat:
+        return normalize_output_format(v)
 
 
 class PathsConfig(BaseModel):
@@ -179,9 +225,8 @@ class PathsConfig(BaseModel):
 
 
 class AitestConfig(BaseModel):
-    provider: Literal["ollama"] = "ollama"
-    base_url: str = "http://localhost:11434"
-    model: str = "qwen2.5-coder:7b"
+    provider: Literal["antigravity"] = "antigravity"
+    model: str | None = None
     language: Literal["python"] = "python"
     test_framework: Literal["pytest"] = "pytest"
     timeout_sec: int = Field(default=120, ge=1, description="Timeout mặc định cho pytest (FR-03)")
@@ -195,20 +240,23 @@ class AitestConfig(BaseModel):
     output: OutputConfig = Field(default_factory=OutputConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
 
-    # Biến bảo mật đọc từ môi trường, tuyệt đối không xuất vào báo cáo/hash
-    ollama_api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
-
-    @field_validator("base_url")
+    @field_validator("model", mode="before")
     @classmethod
-    def normalize_base_url(cls, v: str) -> str:
-        v = v.strip().rstrip("/")
-        if not v:
-            raise ValueError("base_url không được để trống")
-        return v
+    def _validate_model(cls, v: Any) -> str | None:
+        return _normalize_nullable_str(v)
+
+    @property
+    def effective_model_label(self) -> str:
+        """Tên model hiển thị và truy vết (trả về mặc định SDK `gemini-3.8-flash` nếu `model` là None)."""
+        return self.model or SDK_DEFAULT_MODEL
 
     def safe_dump(self) -> dict[str, Any]:
-        """Trả về dict cấu hình an toàn (đã loại bỏ hoàn toàn ollama_api_key)."""
-        return self.model_dump(exclude={"ollama_api_key"})
+        """Trả về dict cấu hình chuẩn hóa phục vụ tính config_hash (loại bỏ secret `api_key`, NFR-03)."""
+        dumped = self.model_dump()
+        llm_section = dumped.get("llm")
+        if isinstance(llm_section, dict):
+            llm_section.pop("api_key", None)
+        return dumped
 
 
 def _parse_dotenv_file(dotenv_path: Path) -> dict[str, str]:
@@ -231,21 +279,6 @@ def _parse_dotenv_file(dotenv_path: Path) -> dict[str, str]:
         if key:
             result[key] = val
     return result
-
-
-def _coerce_env_value(raw_val: str) -> Any:
-    """Chuyển đổi kiểu cơ bản cho giá trị đọc từ biến môi trường."""
-    lower = raw_val.lower().strip()
-    if lower in ("true", "yes", "1"):
-        return True
-    if lower in ("false", "no", "0"):
-        return False
-    try:
-        if "." in raw_val:
-            return float(raw_val)
-        return int(raw_val)
-    except ValueError:
-        return raw_val
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -271,16 +304,9 @@ def _set_nested_key(target: dict[str, Any], keys: list[str], value: Any) -> None
     curr[keys[-1]] = value
 
 
-def _extract_env_overrides(env_map: dict[str, str]) -> tuple[dict[str, Any], str | None]:
-    """Trích xuất cấu hình từ AITEST_* (dùng __ cho nested key) và OLLAMA_*."""
+def _extract_env_overrides(env_map: dict[str, str]) -> dict[str, Any]:
+    """Trích xuất cấu hình từ `AITEST_*` (dùng `__` cho nested key) và biến chuẩn của Google Antigravity SDK."""
     overrides: dict[str, Any] = {}
-    api_key: str | None = None
-
-    if "OLLAMA_BASE_URL" in env_map and env_map["OLLAMA_BASE_URL"].strip():
-        overrides["base_url"] = env_map["OLLAMA_BASE_URL"].strip()
-
-    if "OLLAMA_API_KEY" in env_map and env_map["OLLAMA_API_KEY"].strip():
-        api_key = env_map["OLLAMA_API_KEY"].strip()
 
     prefix = "AITEST_"
     for raw_key, raw_val in env_map.items():
@@ -292,15 +318,32 @@ def _extract_env_overrides(env_map: dict[str, str]) -> tuple[dict[str, Any], str
         parts = [p.lower() for p in stripped.split("__") if p]
         if not parts:
             continue
-        # Không cho phép parse boolean cho những trường string hoặc số nếu cần,
-        # nhưng Pydantic v2 sẽ ép kiểu chuẩn xác từ chuỗi hoặc số.
-        # Tuy nhiên với boolean ("true"/"false") cần lưu ý "1"/"0" có thể là số.
         val: Any = raw_val
-        if raw_val.lower() in ("true", "false"):
-            val = raw_val.lower() == "true"
+        low = raw_val.strip().lower()
+        if low in ("true", "false"):
+            val = low == "true"
+        elif low in ("null", "none", ""):
+            val = ""
         _set_nested_key(overrides, parts, val)
 
-    return overrides, api_key
+    llm_ov = overrides.get("llm") if isinstance(overrides.get("llm"), dict) else {}
+
+    if "api_key" not in llm_ov:
+        api_key = (env_map.get("GEMINI_API_KEY") or env_map.get("GOOGLE_API_KEY") or "").strip()
+        if api_key and api_key != "your_gemini_api_key_here":
+            _set_nested_key(overrides, ["llm", "api_key"], api_key)
+
+    if "project" not in llm_ov:
+        proj = (env_map.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+        if proj:
+            _set_nested_key(overrides, ["llm", "project"], proj)
+
+    if "location" not in llm_ov:
+        loc = (env_map.get("GOOGLE_CLOUD_LOCATION") or "").strip()
+        if loc:
+            _set_nested_key(overrides, ["llm", "location"], loc)
+
+    return overrides
 
 
 def load_config(
@@ -309,8 +352,8 @@ def load_config(
     env: dict[str, str] | None = None,
     dotenv_path: Path | str | None = None,
 ) -> AitestConfig:
-    """Tải và hợp nhất cấu hình theo đúng thứ tự ưu tiên SRS §10.3:
-    CLI flags > Biến môi trường AITEST_* / OLLAMA_* > aitest.yaml > Defaults.
+    """Tải và hợp nhất cấu hình theo đúng thứ tự ưu tiên SRS v4.0.0 §10.3:
+    CLI flags > Biến môi trường AITEST_* / GEMINI_API_KEY > aitest.yaml > Defaults.
     """
     yaml_data: dict[str, Any] = {}
     resolved_config_path = Path(config_path) if config_path else Path("aitest.yaml")
@@ -324,13 +367,10 @@ def load_config(
     dotenv_vars = _parse_dotenv_file(resolved_dotenv) if env is None else {}
     effective_env: dict[str, str] = {**dotenv_vars, **(env if env is not None else dict(os.environ))}
 
-    env_overrides, api_key = _extract_env_overrides(effective_env)
+    env_overrides = _extract_env_overrides(effective_env)
 
     merged = _deep_merge(yaml_data, env_overrides)
     if cli_overrides:
         merged = _deep_merge(merged, cli_overrides)
 
-    config = AitestConfig.model_validate(merged)
-    if api_key:
-        config.ollama_api_key = SecretStr(api_key)
-    return config
+    return AitestConfig.model_validate(merged)

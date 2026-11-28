@@ -3,17 +3,41 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
-import httpx
 from typer.testing import CliRunner
 
 from aitest.agent import run_agent_loop
 from aitest.cli import app
-from aitest.config import AitestConfig
+from aitest.config import SDK_DEFAULT_MODEL, AitestConfig
 from aitest.fixer import fix_test_file
-from aitest.llm.client import OllamaClient
+from aitest.llm.client import AntigravityClient, SDKCallSpec, SDKTurnResult
 from aitest.schemas import ErrorCategory, RunResult
+
+
+def _ensure_fake_credentials(cfg: AitestConfig, tmp_path: Path) -> None:
+    cfg.llm.api_key = "test-api-key"
+
+
+def _sdk_turn_ok(
+    model: str | None,
+    response: str,
+    *,
+    structured_output: dict | None = None,
+    prompt_tokens: int = 50,
+    output_tokens: int = 30,
+) -> SDKTurnResult:
+    return SDKTurnResult(
+        text=response,
+        structured_output=structured_output,
+        model_actual=model or SDK_DEFAULT_MODEL,
+        conversation_id="conv-fix-1",
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        thinking_tokens=0,
+        total_tokens=prompt_tokens + output_tokens,
+    )
 
 
 def test_fixer_stops_immediately_on_unfixable_error_without_calling_llm_ac06(
@@ -27,12 +51,13 @@ def test_fixer_stops_immediately_on_unfixable_error_without_calling_llm_ac06(
 
     llm_called = {"count": 0}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def runner(spec: SDKCallSpec) -> SDKTurnResult:
         llm_called["count"] += 1
-        return httpx.Response(200, json={})
+        return _sdk_turn_ok(spec.model, "")
 
     cfg = AitestConfig()
-    client = OllamaClient(cfg, transport=httpx.MockTransport(handler))
+    _ensure_fake_credentials(cfg, tmp_path)
+    client = AntigravityClient(cfg, sdk_runner=runner)
     initial_run = RunResult(
         target_file=str(src_file),
         test_file=str(test_file),
@@ -72,29 +97,18 @@ def test_fixer_rejects_weakened_assertion_and_accepts_valid_fix_ac07_ac08(
 
     chat_turn = {"n": 0}
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/tags":
-            return httpx.Response(200, json={"models": []})
+    def runner(spec: SDKCallSpec) -> SDKTurnResult:
         chat_turn["n"] += 1
         if chat_turn["n"] == 1:
-            # Lần 1: LLM gian lận bằng tautology assert True
             code = "from calc_fix import add\n\ndef test_add():\n    assert True\n"
         else:
-            # Lần 2: LLM sửa đúng giá trị hằng số kỳ vọng từ 6 thành 5
             code = "from calc_fix import add\n\ndef test_add():\n    assert add(2, 3) == 5\n"
-        return httpx.Response(
-            200,
-            json={
-                "model": "qwen2.5-coder:7b",
-                "message": {"role": "assistant", "content": code},
-                "prompt_eval_count": 50,
-                "eval_count": 30,
-            },
-        )
+        return _sdk_turn_ok(spec.model, code)
 
     cfg = AitestConfig()
     cfg.mutation.enabled = False
-    client = OllamaClient(cfg, transport=httpx.MockTransport(handler), backoff_base_sec=0.0)
+    _ensure_fake_credentials(cfg, tmp_path)
+    client = AntigravityClient(cfg, sdk_runner=runner, backoff_base_sec=0.0)
 
     res = fix_test_file(
         target_file=src_file,
@@ -140,55 +154,33 @@ def test_agent_baseline_vs_feedback_driven_improve_loop_ac13_ac24(
         "    assert can_enter(18) is True\n"
         "    assert can_enter(17) is False\n"
     )
-    eval_json = json.dumps(
-        {
-            "correctness": 9.0,
-            "readability": 9.0,
-            "maintainability": 9.0,
-            "isolation": 9.0,
-            "robustness": 9.0,
-            "determinism": 9.0,
-            "issues": [],
-            "summary": "Đánh giá tốt.",
-        }
-    )
+    eval_obj = {
+        "correctness": 9.0,
+        "readability": 9.0,
+        "maintainability": 9.0,
+        "isolation": 9.0,
+        "robustness": 9.0,
+        "determinism": 9.0,
+        "issues": [],
+        "summary": "Đánh giá tốt.",
+    }
 
-    def make_transport() -> httpx.MockTransport:
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == "/api/tags":
-                return httpx.Response(
-                    200,
-                    json={"models": [{"name": "qwen2.5-coder:7b", "digest": "sha256:abcd"}]},
-                )
-            body = json.loads(request.content.decode("utf-8"))
-            if "format" in body:
-                # Bước eval
-                content = eval_json
-            else:
-                sys_msg = body["messages"][0]["content"]
-                if "mutation-testing engineer" in sys_msg:
-                    content = improve_boundary_test
-                else:
-                    content = initial_weak_test
-            return httpx.Response(
-                200,
-                json={
-                    "model": "qwen2.5-coder:7b",
-                    "message": {"role": "assistant", "content": content},
-                    "prompt_eval_count": 100,
-                    "eval_count": 40,
-                },
-            )
+    def make_runner():
+        def runner(spec: SDKCallSpec) -> SDKTurnResult:
+            if spec.response_schema_model is not None:
+                return _sdk_turn_ok(spec.model, json.dumps(eval_obj), structured_output=eval_obj, prompt_tokens=100, output_tokens=40)
+            content = improve_boundary_test if "mutation-testing engineer" in spec.system_prompt else initial_weak_test
+            return _sdk_turn_ok(spec.model, content, prompt_tokens=100, output_tokens=40)
 
-        return httpx.MockTransport(handler)
+        return runner
 
     cfg = AitestConfig()
-    # Đặt threshold_pass = 8.8 để vòng 1 (mutation < 100%) chưa đạt ngưỡng, buộc Agent B chạy pha improve
     cfg.eval.threshold_pass = 8.8
+    _ensure_fake_credentials(cfg, tmp_path)
 
     # 1. Chạy nhánh Baseline A (--baseline)
     baseline_test_file = tmp_path / "tests_baseline" / "test_gate.py"
-    client_a = OllamaClient(cfg, transport=make_transport(), backoff_base_sec=0.0)
+    client_a = AntigravityClient(cfg, sdk_runner=make_runner(), backoff_base_sec=0.0)
     res_baseline = run_agent_loop(
         target_file=src_file,
         config=cfg,
@@ -204,7 +196,7 @@ def test_agent_baseline_vs_feedback_driven_improve_loop_ac13_ac24(
 
     # 2. Chạy nhánh Agent B (Feedback-driven)
     agent_test_file = tmp_path / "tests_agent" / "test_gate.py"
-    client_b = OllamaClient(cfg, transport=make_transport(), backoff_base_sec=0.0)
+    client_b = AntigravityClient(cfg, sdk_runner=make_runner(), backoff_base_sec=0.0)
     res_agent = run_agent_loop(
         target_file=src_file,
         config=cfg,
@@ -224,6 +216,7 @@ def test_agent_baseline_vs_feedback_driven_improve_loop_ac13_ac24(
 def test_cli_init_and_single_file_constraint_ac01_ac02(tmp_path: Path, monkeypatch) -> None:
     """Kiểm tra AC-01 (`aitest init` không ghi đè khi thiếu `--force`) và AC-02 (`aitest gen` từ chối thư mục)."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-cli-api-key")
     runner = CliRunner()
 
     # AC-01: Lần 1 chạy aitest init -> tạo aitest.yaml, .env.example, .gitignore
@@ -233,18 +226,134 @@ def test_cli_init_and_single_file_constraint_ac01_ac02(tmp_path: Path, monkeypat
     assert yaml_file.is_file()
     assert (tmp_path / ".env.example").is_file()
     assert (tmp_path / ".gitignore").is_file()
+    assert "Google Antigravity SDK" in r1.output
 
     # Sửa nội dung aitest.yaml rồi chạy lại `aitest init` không có --force -> không được ghi đè
-    yaml_file.write_text("# custom config\nmodel: custom:7b\n", encoding="utf-8")
+    yaml_file.write_text("# custom config\nmodel: custom-model\n", encoding="utf-8")
     r2 = runner.invoke(app, ["init"])
     assert r2.exit_code == 0
-    assert "custom:7b" in yaml_file.read_text(encoding="utf-8")
+    assert "custom-model" in yaml_file.read_text(encoding="utf-8")
 
-    # Chạy `aitest init --force` -> ghi đè về mặc định
+    # Chạy `aitest init --force` -> ghi đè về mặc định v4.0.0
     r3 = runner.invoke(app, ["init", "--force"])
     assert r3.exit_code == 0
-    assert "qwen2.5-coder:7b" in yaml_file.read_text(encoding="utf-8")
+    assert "gemini-3.8-flash" in yaml_file.read_text(encoding="utf-8")
 
     # AC-02: Truyền thư mục vào `aitest gen` -> báo lỗi rõ ràng, exit_code != 0
     r_dir = runner.invoke(app, ["gen", str(tmp_path)])
     assert r_dir.exit_code != 0
+
+
+def test_targeted_function_fix_preserves_passing_tests_and_selective_improve(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Kiểm tra Targeted Fix, Verified Run Reuse và Selective Improve với AntigravityClient."""
+    src_file = tmp_path / "arith.py"
+    src_file.write_text(
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b\n\n"
+        "def is_even(n: int) -> bool:\n"
+        "    if n % 2 == 0:\n"
+        "        return True\n"
+        "    return False\n",
+        encoding="utf-8",
+    )
+    test_file = tmp_path / "tests" / "test_arith.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text(
+        "from arith import add, is_even\n\n"
+        "def test_add():\n"
+        "    # comment kept untouched\n"
+        "    assert add(2, 3) == 5\n\n"
+        "def test_is_even():\n"
+        "    assert is_even(4) == False\n",
+        encoding="utf-8",
+    )
+
+    seen_prompts: list[str] = []
+
+    def fix_runner(spec: SDKCallSpec) -> SDKTurnResult:
+        seen_prompts.append(spec.full_prompt)
+        return _sdk_turn_ok(
+            spec.model,
+            "def test_is_even():\n    assert is_even(4) is True\n",
+        )
+
+    cfg = AitestConfig()
+    cfg.mutation.enabled = False
+    _ensure_fake_credentials(cfg, tmp_path)
+    fix_res = fix_test_file(
+        target_file=src_file,
+        config=cfg,
+        test_file=test_file,
+        llm_client=AntigravityClient(cfg, sdk_runner=fix_runner, backoff_base_sec=0.0),
+        project_root=tmp_path,
+    )
+    assert fix_res.fixed is True
+    assert len(seen_prompts) == 1
+    assert "Failing Test Function(s)" in seen_prompts[0]
+    final_txt = test_file.read_text(encoding="utf-8")
+    assert "# comment kept untouched" in final_txt
+    assert "assert is_even(4) is True" in final_txt
+
+    src2 = tmp_path / "check_num.py"
+    src2.write_text(
+        "def above_ten(x: int) -> bool:\n"
+        "    if x >= 10:\n"
+        "        return True\n"
+        "    return False\n",
+        encoding="utf-8",
+    )
+    gen_code = "from check_num import above_ten\n\ndef test_above():\n    assert above_ten(20) is True\n"
+    improve_mixed = (
+        "def test_boundary_10_good():\n"
+        "    assert above_ten(10) is True\n"
+        "    assert above_ten(9) is False\n\n"
+        "def test_wrong_calc_bad():\n"
+        "    assert above_ten(10) is False\n"
+    )
+    eval_obj = {
+        "correctness": 9.0,
+        "readability": 9.0,
+        "maintainability": 9.0,
+        "isolation": 9.0,
+        "robustness": 9.0,
+        "determinism": 9.0,
+        "issues": [],
+        "summary": "Tốt.",
+    }
+
+    def agent_runner(spec: SDKCallSpec) -> SDKTurnResult:
+        if spec.response_schema_model is not None:
+            return _sdk_turn_ok(spec.model, json.dumps(eval_obj), structured_output=eval_obj)
+        c = improve_mixed if "mutation-testing engineer" in spec.system_prompt else gen_code
+        return _sdk_turn_ok(spec.model, c)
+
+    import aitest.agent as agent_mod
+
+    run_calls = {"count": 0}
+    orig_run_tests = agent_mod.run_tests
+
+    def counted_run_tests(*args, **kwargs):
+        run_calls["count"] += 1
+        return orig_run_tests(*args, **kwargs)
+
+    monkeypatch.setattr(agent_mod, "run_tests", counted_run_tests)
+
+    cfg2 = AitestConfig()
+    cfg2.eval.threshold_pass = 8.9
+    _ensure_fake_credentials(cfg2, tmp_path)
+    agent_test = tmp_path / "tests" / "test_check_num.py"
+    agent_res = run_agent_loop(
+        target_file=src2,
+        config=cfg2,
+        test_file=agent_test,
+        max_iters=2,
+        llm_client=AntigravityClient(cfg2, sdk_runner=agent_runner, backoff_base_sec=0.0),
+        project_root=tmp_path,
+    )
+    assert agent_res.final_report.execution.all_tests_passed is True
+    assert agent_res.final_report.objective_metrics.mutation_score_pct == 100.0
+    assert any("Selective Accept" in h.reason for h in agent_res.history if h.action == "improve")
+    assert run_calls["count"] == 3

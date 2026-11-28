@@ -11,6 +11,7 @@ from aitest.generator import (
     TestGenerationSyntaxError,
     safe_merge_and_append,
 )
+from aitest.utils import resolve_test_file_path
 
 
 def test_safe_append_dedup_rename_and_backup_ac03(tmp_path: Path) -> None:
@@ -145,3 +146,42 @@ def test_safe_append_rejects_syntax_error_and_preserves_old_file_ac17(tmp_path: 
 
     assert test_file.read_text(encoding="utf-8") == orig_code
     assert any(log_dir.glob("*syntax_error_gen.log"))
+
+
+def test_safe_append_supports_test_class_and_collision_guard(tmp_path: Path) -> None:
+    """Kiểm tra P1.6 (append class Test*) và P0.4 (Collision Guard khi trùng stem khác module)."""
+    test_file = tmp_path / "tests" / "test_calc.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text(
+        "from examples.calc import add\n\ndef test_base():\n    assert add(1, 1) == 2\n",
+        encoding="utf-8",
+    )
+
+    class_chunk = """\
+class TestExtraCalc:
+    def test_add_zero(self):
+        assert add(0, 5) == 5
+"""
+    res = safe_merge_and_append(
+        test_file=test_file,
+        new_code=class_chunk,
+        mode="append",
+        backup_dir=tmp_path / ".aitest_backup",
+        log_dir=tmp_path / ".aitest_logs",
+    )
+    assert "TestExtraCalc.test_add_zero" in res.added_tests
+    assert "class TestExtraCalc:" in test_file.read_text(encoding="utf-8")
+
+    # Collision Guard: tests/test_analyzer.py đã test `aitest.analyzer`,
+    # nên target `examples/analyzer.py` phải tự tách sang `tests/test_examples_analyzer.py`.
+    (tmp_path / "examples").mkdir(parents=True, exist_ok=True)
+    ex_target = tmp_path / "examples" / "analyzer.py"
+    ex_target.write_text("def parse():\n    return 1\n", encoding="utf-8")
+
+    existing_sys_test = tmp_path / "tests" / "test_analyzer.py"
+    existing_sys_test.write_text(
+        "from aitest.analyzer import analyze_source_code\n\ndef test_sys():\n    assert True\n",
+        encoding="utf-8",
+    )
+    resolved = resolve_test_file_path(ex_target, tests_dir="tests", project_root=tmp_path)
+    assert resolved == Path("tests/test_examples_analyzer.py")

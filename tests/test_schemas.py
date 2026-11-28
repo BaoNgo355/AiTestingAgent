@@ -18,14 +18,16 @@ from aitest.schemas import (
 
 def _sample_meta() -> Meta:
     return Meta(
-        version="2.3.0",
-        generated_at="2026-11-21T10:00:00Z",
+        version="4.0.0",
+        generated_at="2026-11-28T10:00:00Z",
         target_file="examples/calculator.py",
         test_file="tests/test_calculator.py",
-        base_url="http://localhost:11434",
-        model_requested="qwen2.5-coder:7b",
-        model_actual="qwen2.5-coder:7b",
-        model_digest="sha256:dae161e27b0e90dd1856c8bb3209201fd6736d8eb66298e75ed87571486f4364",
+        model_requested="gemini-3.8-flash",
+        model_actual="gemini-3.8-flash",
+        judge_model_requested="gemini-3.8-flash",
+        judge_model_actual="gemini-3.8-flash",
+        vertex=False,
+        conversation_id="conv-schema-test",
         config_hash="sha256:0123456789abcdef",
         run_id="run-schema-test",
     )

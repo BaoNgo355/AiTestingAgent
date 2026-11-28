@@ -1,4 +1,4 @@
-"""Kịch bản thực nghiệm tự động đối sánh Baseline A (`--baseline`) vs Agent B (`aitest agent`) theo SRS v2.3.0 §16.
+"""Kịch bản thực nghiệm tự động đối sánh Baseline A (`--baseline`) vs Agent B (`aitest agent`) theo SRS v3.0.0 §16.
 
 Cách dùng:
     python scripts/run_experiment.py [--runs 3] [--max-iters 3] [--threshold 8.0] [--files examples/calculator.py ...]
@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import platform
 import shutil
 import statistics
@@ -23,6 +22,7 @@ from rich.table import Table
 from aitest.agent import AgentRunResult, run_agent_loop
 from aitest.config import AitestConfig, load_config
 from aitest.progress import RichProgressReporter
+from aitest.reporting import render_experiment_csv, render_experiment_html
 from aitest.utils import atomic_write_text, utc_now_iso
 
 DEFAULT_EXAMPLE_FILES: tuple[str, ...] = (
@@ -158,17 +158,71 @@ def summarize_branch_runs(runs: list[AgentRunResult]) -> dict[str, Any]:
     }
 
 
+def compute_per_file_deltas(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Tính chênh lệch Δ Mutation Score (Agent B - Baseline A) và tỷ lệ Win/Tie/Loss theo từng file (§16.5)."""
+    grouped: dict[str, dict[str, list[float]]] = {}
+    for rec in records:
+        t_file = str(rec.get("target_file", ""))
+        b_a = rec.get("baseline_a", {})
+        b_b = rec.get("agent_b", {})
+        if not b_a.get("report_comparable") or not b_b.get("report_comparable"):
+            continue
+        mut_a = b_a.get("mutation_score_pct")
+        mut_b = b_b.get("mutation_score_pct")
+        if mut_a is None or mut_b is None:
+            continue
+        entry = grouped.setdefault(t_file, {"a": [], "b": []})
+        entry["a"].append(float(mut_a))
+        entry["b"].append(float(mut_b))
+
+    per_file: list[dict[str, Any]] = []
+    wins = 0
+    ties = 0
+    losses = 0
+    for t_file, vals in grouped.items():
+        mean_a = round(statistics.mean(vals["a"]), 2)
+        mean_b = round(statistics.mean(vals["b"]), 2)
+        delta = round(mean_b - mean_a, 2)
+        if delta > 1e-6:
+            outcome = "Win"
+            wins += 1
+        elif delta < -1e-6:
+            outcome = "Loss"
+            losses += 1
+        else:
+            outcome = "Tie"
+            ties += 1
+        per_file.append(
+            {
+                "target_file": t_file,
+                "baseline_a_mean_mut_pct": mean_a,
+                "agent_b_mean_mut_pct": mean_b,
+                "delta_mut_pct": delta,
+                "outcome": outcome,
+            }
+        )
+
+    return {
+        "per_file": per_file,
+        "win_tie_loss": {"win": wins, "tie": ties, "loss": losses},
+    }
+
+
 def render_markdown_comparison_report(summary_data: dict[str, Any]) -> str:
-    """Sinh báo cáo đối sánh dạng Markdown bảng Mean ± SD giữa Baseline A và Agent B."""
+    """Sinh báo cáo đối sánh dạng Markdown bảng Mean ± SD và Δ Mutation Score giữa Baseline A và Agent B."""
     b_a = summary_data["baseline_a_summary"]
     b_b = summary_data["agent_b_summary"]
     meta = summary_data["meta"]
+
+    provider_str = meta.get("provider", "antigravity")
+    judge_str = meta.get("judge_model") or meta.get("model")
+    endpoint_str = "Vertex AI" if meta.get("vertex") else "Gemini API"
 
     lines: list[str] = [
         "# Báo cáo Thực nghiệm Đối sánh: Baseline A vs Agent B (`aitest`)",
         "",
         f"- **Thời gian thực hiện:** `{meta['generated_at']}`",
-        f"- **Model:** `{meta['model']}` (temperature=`{meta['temperature']}`, num_ctx=`{meta['num_ctx']}`)",
+        f"- **Provider:** `{provider_str}` | **Model:** `{meta['model']}` | **Judge Model:** `{judge_str}` | **Endpoint:** `{endpoint_str}`",
         f"- **Số lần chạy lặp mỗi file (`runs`):** `{meta['runs_per_file']}`",
         f"- **Số vòng lặp tối đa (`max_iters`):** `{meta['max_iters']}` | **Ngưỡng đạt (`threshold_pass`):** `{meta['threshold_pass']}`",
         f"- **Cấu hình hệ thống:** `{meta['platform']}` (Python `{meta['python_version']}`)",
@@ -191,6 +245,28 @@ def render_markdown_comparison_report(summary_data: dict[str, Any]) -> str:
         f"| | Thời gian thực thi (`runtime_sec`) | {b_a['runtime_sec']['formatted']} | {b_b['runtime_sec']['formatted']} |",
         "",
     ]
+
+    delta_summary = summary_data.get("delta_analysis")
+    if delta_summary and delta_summary.get("per_file"):
+        wtl = delta_summary["win_tie_loss"]
+        lines.extend(
+            [
+                "## 2. Phân tích Mức cải thiện theo File (Δ Mutation Score & Win/Tie/Loss)",
+                "",
+                f"- **Win / Tie / Loss (Agent B vs Baseline A):** `{wtl['win']} / {wtl['tie']} / {wtl['loss']}`",
+                "",
+                "| File nguồn | Baseline A (%) | Agent B (%) | Δ Mutation Score | Kết quả |",
+                "|---|---:|---:|---:|---|",
+            ]
+        )
+        for row in delta_summary["per_file"]:
+            sign = "+" if row["delta_mut_pct"] > 0 else ""
+            lines.append(
+                f"| `{row['target_file']}` | {row['baseline_a_mean_mut_pct']:.2f}% | "
+                f"{row['agent_b_mean_mut_pct']:.2f}% | {sign}{row['delta_mut_pct']:.2f}% | **{row['outcome']}** |"
+            )
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -201,16 +277,24 @@ def run_experiment(
     max_iters: int = 3,
     threshold_pass: float = 8.0,
     model_override: str | None = None,
+    judge_model: str | None = None,
     output_json: Path | str = ".aitest_logs/experiment_report.json",
     output_md: Path | str = ".aitest_logs/experiment_report.md",
+    output_html: Path | str = ".aitest_logs/experiment_report.html",
+    output_csv: Path | str = ".aitest_logs/experiment_summary.csv",
     project_root: Path | str | None = None,
     quiet: bool = False,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """Thực thi kịch bản đối sánh thực nghiệm Baseline A và Agent B trên tập file mẫu."""
     root_dir = Path(project_root).resolve() if project_root else Path.cwd().resolve()
-    cli_overrides = {"model": model_override} if model_override else None
-    cfg: AitestConfig = load_config(cli_overrides=cli_overrides)
+    cli_overrides: dict[str, Any] = {}
+    if model_override:
+        cli_overrides["model"] = model_override
+    if judge_model:
+        cli_overrides.setdefault("eval", {})["judge_model"] = judge_model
+
+    cfg: AitestConfig = load_config(cli_overrides=cli_overrides or None)
     cfg.agent.max_iters = max_iters
     cfg.eval.threshold_pass = threshold_pass
     reporter = RichProgressReporter(console=console, quiet=quiet, verbose=verbose)
@@ -302,14 +386,15 @@ def run_experiment(
 
     summary_a = summarize_branch_runs(baseline_results)
     summary_b = summarize_branch_runs(agent_results)
+    delta_analysis = compute_per_file_deltas(per_file_records)
 
     payload: dict[str, Any] = {
         "meta": {
             "generated_at": utc_now_iso(),
-            "model": cfg.model,
-            "temperature": cfg.llm.temperature,
-            "num_ctx": cfg.llm.num_ctx,
-            "max_tokens": cfg.llm.max_tokens,
+            "provider": cfg.provider,
+            "model": cfg.effective_model_label,
+            "judge_model": cfg.eval.judge_model,
+            "vertex": cfg.llm.vertex,
             "runs_per_file": runs_per_file,
             "max_iters": max_iters,
             "threshold_pass": threshold_pass,
@@ -319,14 +404,19 @@ def run_experiment(
         },
         "baseline_a_summary": summary_a,
         "agent_b_summary": summary_b,
+        "delta_analysis": delta_analysis,
         "runs": per_file_records,
     }
 
     out_json_path = root_dir / output_json
     out_md_path = root_dir / output_md
+    out_html_path = root_dir / output_html
+    out_csv_path = root_dir / output_csv
     atomic_write_text(out_json_path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     md_content = render_markdown_comparison_report(payload)
     atomic_write_text(out_md_path, md_content)
+    atomic_write_text(out_html_path, render_experiment_html(payload))
+    atomic_write_text(out_csv_path, "\ufeff" + render_experiment_csv(payload))
 
     # Hiển thị bảng đối sánh ra terminal bằng Rich
     table = Table(
@@ -352,7 +442,9 @@ def run_experiment(
     console.print(
         Panel(
             f"Đã lưu báo cáo JSON: [bold]{out_json_path}[/bold]\n"
-            f"Đã lưu báo cáo Markdown: [bold]{out_md_path}[/bold]",
+            f"Đã lưu báo cáo Markdown: [bold]{out_md_path}[/bold]\n"
+            f"Đã lưu báo cáo HTML (SVG): [bold]{out_html_path}[/bold]\n"
+            f"Đã lưu bảng CSV (Excel UTF-8 BOM): [bold]{out_csv_path}[/bold]",
             title="Hoàn tất Thực nghiệm",
             border_style="green",
         )
@@ -362,7 +454,7 @@ def run_experiment(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Chạy kịch bản thực nghiệm đối sánh Baseline A vs Agent B cho aitest."
+        description="Chạy kịch bản thực nghiệm đối sánh Baseline A vs Agent B cho aitest (Google Antigravity)."
     )
     parser.add_argument(
         "--files",
@@ -392,7 +484,13 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default=None,
-        help="Ghi đè tên model Ollama (mặc định lấy từ aitest.yaml).",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định dùng gemini-3.8-flash).",
+    )
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default=None,
+        help="Chỉ định model riêng cho bước chấm điểm eval (tùy chọn).",
     )
     parser.add_argument(
         "--output-json",
@@ -405,6 +503,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=".aitest_logs/experiment_report.md",
         help="Đường dẫn file xuất bảng đối sánh Markdown.",
+    )
+    parser.add_argument(
+        "--output-html",
+        type=str,
+        default=".aitest_logs/experiment_report.html",
+        help="Đường dẫn file xuất báo cáo đối sánh HTML (kèm biểu đồ SVG).",
+    )
+    parser.add_argument(
+        "--output-csv",
+        type=str,
+        default=".aitest_logs/experiment_summary.csv",
+        help="Đường dẫn file xuất bảng tổng hợp CSV cho Excel.",
     )
     parser.add_argument(
         "--quiet",
@@ -428,8 +538,11 @@ if __name__ == "__main__":
         max_iters=args.max_iters,
         threshold_pass=args.threshold,
         model_override=args.model,
+        judge_model=args.judge_model,
         output_json=args.output_json,
         output_md=args.output_md,
+        output_html=args.output_html,
+        output_csv=args.output_csv,
         quiet=args.quiet,
         verbose=args.verbose,
     )

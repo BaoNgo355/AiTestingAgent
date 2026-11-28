@@ -53,9 +53,10 @@ Python module import path: `{{ module_name }}` (import target symbols using `fro
    - Normal / happy paths with exact expected values (`assert actual == expected`). Double-check all arithmetic calculations against the source code logic.
    - Boundary and edge conditions (0, negative numbers, empty strings/collections, exact threshold boundaries such as `<` vs `<=` and `>` vs `>=`).
    - Error and exception paths using `with pytest.raises(SpecificException):` where the arguments passed strictly match the exact `if ...: raise SpecificException(...)` branch in the source code (for example, distinguish `TypeError` for wrong type vs `ValueError` for invalid value).
-3. Ensure every test function is deterministic, isolated, and named `test_<descriptive_name>`.
-4. Never use trivial tautologies (`assert True`, `assert x is not None` when a concrete value can be asserted) or `@pytest.mark.skip` / `xfail`.
-5. Return ONLY raw Python code ready to be parsed by `ast.parse()`.
+3. Write focused, granular `test_*` functions separating normal cases, boundary cases, and distinct exception cases into separate functions (instead of packing many unrelated assertions into one giant test function), so each failure is isolated.
+4. Ensure every test function is deterministic, isolated, and named `test_<descriptive_name>`.
+5. Never use trivial tautologies (`assert True`, `assert x is not None` when a concrete value can be asserted) or `@pytest.mark.skip` / `xfail`.
+6. Return ONLY raw Python code ready to be parsed by `ast.parse()`.
 """
 )
 
@@ -107,6 +108,51 @@ Classified Error Category: {{ error_category }}
 """
 )
 
+FIX_TARGETED_SYSTEM_PROMPT = (
+    "You are an expert Python test maintainer. "
+    "Fix ONLY the failing pytest test function(s) provided below so they pass against the source code. "
+    "Do NOT modify the source code. Do NOT delete any failing test functions. "
+    "Do NOT add skip/xfail markers. Do NOT weaken assertions into tautologies "
+    "(such as assert True or assert x is not None). "
+    "Return ONLY the fixed test function(s) (and any newly required import lines) as raw Python code."
+)
+
+FIX_TARGETED_USER_TEMPLATE = _JINJA_ENV.from_string(
+    """\
+Target file path: {{ target_file }}
+Python module import path: `{{ module_name }}`
+Classified Error Category: {{ error_category }}
+
+### Reference Source Code (READ-ONLY — represents true behavior)
+{{ source_code }}
+
+{% if ast_summary_lines is defined and ast_summary_lines %}
+### Extracted AST Targets & Exact Exception Conditions
+{% for line in ast_summary_lines %}
+{{ line }}
+{% endfor %}
+{% endif %}
+
+{% if header_context %}
+### Existing Test File Imports / Fixtures / Helpers (READ-ONLY — reuse as needed)
+{{ header_context }}
+{% endif %}
+
+### Failing Test Function(s) to Fix (`{{ test_file }}`)
+{{ failing_tests_code }}
+
+### Pytest Output & Traceback
+{{ pytest_output }}
+
+### How to Fix (MUST make actual code changes!)
+1. For any `AssertionError: assert <actual> == <expected>`: update the expected value (or input arguments) so it matches the true output of the Reference Source Code (use `pytest.approx(...)` or `math.isclose(...)` if floating-point precision differs).
+2. For any failing `with pytest.raises(ExpectedException):`: do NOT delete it; instead adjust the arguments inside the `with` block so they actually trigger `ExpectedException` according to the Reference Source Code.
+3. Keep the exact function name(s): {{ failing_test_names | join(', ') }}.
+4. Keep at least the same number of `assert` statements and `with pytest.raises(...)` blocks in each function, and do NOT add `@pytest.mark.skip`, `skipif`, `xfail`, or weaken `==` into `is not None` / `assert True` / `!=` / `>=` / `<=`.
+5. Return ONLY the fixed test function(s) (and any new imports needed, e.g. `import math`) as raw Python code without markdown fences.
+"""
+)
+
 # =====================================================================
 # Phụ lục C: Prompt `improve` (Bổ sung test diệt Survived Mutants)
 # =====================================================================
@@ -134,6 +180,22 @@ Python module import path: `{{ module_name }}` (import target symbols using `fro
 {% endfor %}
 {% else %}
 - (None)
+{% endif %}
+
+{% if (existing_fixtures is defined and existing_fixtures) or (existing_helpers is defined and existing_helpers) %}
+### Existing Fixtures & Helpers (REUSE these directly — DO NOT redefine them!)
+{% if existing_fixtures is defined and existing_fixtures %}
+{% for fix_src in existing_fixtures %}
+{{ fix_src }}
+
+{% endfor %}
+{% endif %}
+{% if existing_helpers is defined and existing_helpers %}
+{% for help_src in existing_helpers %}
+{{ help_src }}
+
+{% endfor %}
+{% endif %}
 {% endif %}
 
 ### Surviving Mutants to Kill
@@ -216,6 +278,10 @@ def render_gen_prompt(**context: Any) -> tuple[str, str]:
 
 def render_fix_prompt(**context: Any) -> tuple[str, str]:
     return FIX_SYSTEM_PROMPT, FIX_USER_TEMPLATE.render(**context)
+
+
+def render_targeted_fix_prompt(**context: Any) -> tuple[str, str]:
+    return FIX_TARGETED_SYSTEM_PROMPT, FIX_TARGETED_USER_TEMPLATE.render(**context)
 
 
 def render_improve_prompt(**context: Any) -> tuple[str, str]:

@@ -23,7 +23,7 @@ def test_rich_progress_reporter_tty_and_non_tty_modes() -> None:
         )
 
         rep.on_agent_iteration_start(iteration=1, max_iters=3, baseline=False)
-        with rep.step("Đang gọi Ollama sinh test", done_message="Đã sinh xong test"):
+        with rep.step("Đang gọi Antigravity sinh test", done_message="Đã sinh xong test"):
             pass
 
         rep.on_mutation_start(total_mutants=2, target_file="examples/calc.py")
@@ -84,9 +84,10 @@ def test_rich_progress_reporter_quiet_and_verbose_modes() -> None:
     q_rep.warn("warn")
     q_rep.on_llm_call_end(
         task_name="gen",
-        model="qwen2.5-coder:7b",
+        model="gemini-3.8-flash",
         prompt_tokens=100,
         completion_tokens=50,
+        thinking_tokens=10,
         latency_ms=500,
     )
     assert q_buf.getvalue() == ""
@@ -102,9 +103,10 @@ def test_rich_progress_reporter_quiet_and_verbose_modes() -> None:
     )
     v_rep.on_llm_call_end(
         task_name="gen",
-        model="qwen2.5-coder:7b",
+        model="gemini-3.8-flash",
         prompt_tokens=100,
         completion_tokens=50,
+        thinking_tokens=10,
         latency_ms=500,
     )
     v_rep.on_mutant_tested(
@@ -117,7 +119,8 @@ def test_rich_progress_reporter_quiet_and_verbose_modes() -> None:
         survived_so_far=0,
     )
     v_out = v_buf.getvalue()
-    assert "150 tokens" in v_out
+    assert "160 tokens" in v_out
+    assert "10 thinking" in v_out
     assert "Mutant killed" in v_out
 
     # 3. NullProgressReporter no-op

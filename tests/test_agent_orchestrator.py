@@ -1,67 +1,63 @@
-"""Unit tests cho aitest.agent và toàn bộ 5 điều kiện dừng theo thứ tự ưu tiên SRS §6.3 (Giai đoạn 5 - AC-13, AC-24)."""
+"""Unit tests cho aitest.agent và toàn bộ 5 điều kiện dừng theo thứ tự ưu tiên SRS v3.0.0 §6.3 (AC-13, AC-24)."""
 
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
-import httpx
 import pytest
 
 from aitest.agent import run_agent_loop
 from aitest.analyzer import analyze_source_file
-from aitest.config import AitestConfig
-from aitest.llm.client import OllamaClient
+from aitest.config import SDK_DEFAULT_MODEL, AitestConfig
+from aitest.llm.client import AntigravityClient, SDKCallSpec, SDKTurnResult
 from aitest.mutation import collect_ast_mutants
 
 
 def _make_agent_client(
     cfg: AitestConfig,
+    tmp_path: Path,
     *,
     gen_code: str,
     improve_code: str = "def test_extra():\n    assert 1 == 1\n",
     eval_scores: float = 7.0,
     tokens_per_call: int = 100,
-) -> OllamaClient:
-    eval_payload = json.dumps(
-        {
-            "correctness": eval_scores,
-            "readability": eval_scores,
-            "maintainability": eval_scores,
-            "isolation": eval_scores,
-            "robustness": eval_scores,
-            "determinism": eval_scores,
-            "issues": [],
-            "summary": "Đánh giá tự động.",
-        }
-    )
+) -> AntigravityClient:
+    cfg.llm.api_key = "test-api-key"
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/tags":
-            return httpx.Response(
-                200,
-                json={"models": [{"name": cfg.model, "digest": "sha256:deadbeef"}]},
-            )
-        body = json.loads(request.content.decode("utf-8"))
-        if "format" in body:
+    eval_obj = {
+        "correctness": eval_scores,
+        "readability": eval_scores,
+        "maintainability": eval_scores,
+        "isolation": eval_scores,
+        "robustness": eval_scores,
+        "determinism": eval_scores,
+        "issues": [],
+        "summary": "Đánh giá tự động.",
+    }
+    eval_payload = json.dumps(eval_obj)
+
+    def runner(spec: SDKCallSpec) -> SDKTurnResult:
+        if spec.response_schema_model is not None:
             content = eval_payload
+            structured = eval_obj
         else:
-            sys_msg = body["messages"][0]["content"]
-            if "mutation-testing engineer" in sys_msg:
-                content = improve_code
-            else:
-                content = gen_code
-        return httpx.Response(
-            200,
-            json={
-                "model": cfg.model,
-                "message": {"role": "assistant", "content": content},
-                "prompt_eval_count": tokens_per_call // 2,
-                "eval_count": tokens_per_call // 2,
-            },
+            content = improve_code if "mutation-testing engineer" in spec.system_prompt else gen_code
+            structured = None
+
+        return SDKTurnResult(
+            text=content,
+            structured_output=structured,
+            model_actual=spec.model or SDK_DEFAULT_MODEL,
+            conversation_id="conv-orch-1",
+            prompt_tokens=tokens_per_call // 2,
+            completion_tokens=tokens_per_call // 2,
+            thinking_tokens=0,
+            total_tokens=tokens_per_call,
         )
 
-    return OllamaClient(cfg, transport=httpx.MockTransport(handler), backoff_base_sec=0.0)
+    return AntigravityClient(cfg, sdk_runner=runner, backoff_base_sec=0.0)
 
 
 def test_agent_stopping_priority_1_unfixable_error_ac13(tmp_path: Path) -> None:
@@ -72,7 +68,7 @@ def test_agent_stopping_priority_1_unfixable_error_ac13(tmp_path: Path) -> None:
     # Test sinh ra import một thư viện không tồn tại -> ENVIRONMENT_ERROR
     bad_env_test = "import non_existent_library_999\n\ndef test_calc():\n    assert True\n"
     cfg = AitestConfig()
-    client = _make_agent_client(cfg, gen_code=bad_env_test)
+    client = _make_agent_client(cfg, tmp_path, gen_code=bad_env_test)
 
     res = run_agent_loop(
         target_file=src_file,
@@ -100,7 +96,7 @@ def test_agent_stopping_priority_2_budget_exceeded_ac13(tmp_path: Path) -> None:
     cfg = AitestConfig()
     cfg.eval.threshold_pass = 9.9
     # Gen tốn 1 call + Eval vòng 1 tốn 1 call = 2 calls -> chạm ngưỡng max_llm_calls=2
-    client = _make_agent_client(cfg, gen_code=weak_test, eval_scores=7.0)
+    client = _make_agent_client(cfg, tmp_path, gen_code=weak_test, eval_scores=7.0)
 
     res = run_agent_loop(
         target_file=src_file,
@@ -134,6 +130,7 @@ def test_agent_stopping_priority_4_and_5_max_iters_and_early_stop_ac13(tmp_path:
 
     client = _make_agent_client(
         cfg,
+        tmp_path,
         gen_code=weak_test,
         improve_code=no_gain_improve,
         eval_scores=7.0,
@@ -176,7 +173,7 @@ def test_examples_dataset_ast_and_mutants_valid(example_filename: str) -> None:
 
 
 def test_experiment_summary_and_markdown_report(tmp_path: Path) -> None:
-    """Kiểm tra hàm tổng hợp Mean ± SD và bảng báo cáo Markdown của scripts/run_experiment.py."""
+    """Kiểm tra hàm tổng hợp Mean ± SD và Δ Mutation Score của scripts/run_experiment.py."""
     import importlib.util
 
     project_root = Path(__file__).resolve().parent.parent
@@ -190,7 +187,7 @@ def test_experiment_summary_and_markdown_report(tmp_path: Path) -> None:
     src_file.write_text("def inc(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
     good_test = "from simple import inc\n\ndef test_inc():\n    assert inc(1) == 2\n"
     cfg = AitestConfig()
-    client = _make_agent_client(cfg, gen_code=good_test, eval_scores=9.0)
+    client = _make_agent_client(cfg, tmp_path, gen_code=good_test, eval_scores=9.0)
 
     r1 = run_agent_loop(
         target_file=src_file,
@@ -205,13 +202,26 @@ def test_experiment_summary_and_markdown_report(tmp_path: Path) -> None:
     assert branch_summary["comparable_runs"] == 1
     assert branch_summary["all_tests_passed_rate_pct"] == 100.0
 
+    deltas = mod.compute_per_file_deltas(
+        [
+            {
+                "target_file": "examples/simple.py",
+                "baseline_a": {"report_comparable": True, "mutation_score_pct": 75.0},
+                "agent_b": {"report_comparable": True, "mutation_score_pct": 100.0},
+            }
+        ]
+    )
+    assert deltas["win_tie_loss"] == {"win": 1, "tie": 0, "loss": 0}
+    assert deltas["per_file"][0]["delta_mut_pct"] == 25.0
+
     md = mod.render_markdown_comparison_report(
         {
             "meta": {
-                "generated_at": "2026-11-21T12:00:00Z",
-                "model": "qwen2.5-coder:7b",
-                "temperature": 0.2,
-                "num_ctx": 8192,
+                "generated_at": "2026-11-28T12:00:00Z",
+                "provider": "antigravity",
+                "model": "gemini-3.8-flash",
+                "judge_model": None,
+                "vertex": False,
                 "runs_per_file": 1,
                 "max_iters": 3,
                 "threshold_pass": 8.0,
@@ -220,7 +230,9 @@ def test_experiment_summary_and_markdown_report(tmp_path: Path) -> None:
             },
             "baseline_a_summary": branch_summary,
             "agent_b_summary": branch_summary,
+            "delta_analysis": deltas,
         }
     )
     assert "Mean ± SD" in md
     assert "Mutation Score (%)" in md
+    assert "Win / Tie / Loss" in md

@@ -1,14 +1,13 @@
-"""Unit tests cho aitest.llm.client, aitest.llm.prompts và aitest.context (Giai đoạn 2 - AC-14, AC-16, AC-18)."""
+"""Unit tests cho aitest.llm.client (Google Antigravity SDK), aitest.llm.prompts và aitest.context (AC-14, AC-16, AC-18)."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-import httpx
 import pytest
 
-from aitest.config import AitestConfig
+from aitest.config import SDK_DEFAULT_MODEL, AitestConfig
 from aitest.context import (
     build_eval_prompts,
     build_fix_prompts,
@@ -16,135 +15,188 @@ from aitest.context import (
     build_improve_prompts,
 )
 from aitest.llm.client import (
-    OllamaClient,
-    OllamaModelNotFoundError,
-    OllamaSchemaValidationError,
-    OllamaServerError,
+    AntigravityAuthError,
+    AntigravityClient,
+    AntigravityModelNotFoundError,
+    AntigravitySchemaValidationError,
+    AntigravityServerError,
+    SDKCallSpec,
+    SDKTurnResult,
+    build_sdk_agent_config,
+    validate_sdk_credentials,
 )
-from aitest.schemas import ErrorCategory, MutationResult, RunResult, SurvivedMutant
+from aitest.schemas import ErrorCategory, LLMAssessment, MutationResult, RunResult, SurvivedMutant
 
 
-def test_ollama_client_tags_chat_and_retry_ac14_ac18() -> None:
-    """Kiểm tra lấy model_digest, thống kê token/latency, retry 5xx và báo lỗi 404 model not found."""
-    attempts = {"chat": 0}
+def test_build_sdk_agent_config_isolation_and_credential_validation(tmp_path: Path) -> None:
+    """Kiểm tra khởi tạo LocalAgentConfig thực của SDK (khóa tool, app_data_dir, model=None mặc định) và validate key."""
+    # Thiếu GEMINI_API_KEY ở chế độ mặc định -> AntigravityAuthError có link Google AI Studio
+    cfg_no_key = AitestConfig()
+    with pytest.raises(AntigravityAuthError, match="aistudio.google.com"):
+        validate_sdk_credentials(cfg_no_key)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/tags":
-            return httpx.Response(
-                200,
-                json={
-                    "models": [
-                        {
-                            "name": "qwen2.5-coder:7b",
-                            "digest": "2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730",
-                        }
-                    ]
-                },
-            )
-        if request.url.path == "/api/chat":
-            attempts["chat"] += 1
-            if attempts["chat"] == 1:
-                return httpx.Response(500, text="Temporary internal error")
-            return httpx.Response(
-                200,
-                json={
-                    "model": "qwen2.5-coder:7b",
-                    "message": {"role": "assistant", "content": "def test_ok():\n    assert 1 == 1\n"},
-                    "prompt_eval_count": 120,
-                    "eval_count": 30,
-                },
-            )
-        return httpx.Response(404)
+    # Vertex AI thiếu cả api_key lẫn project+location -> AntigravityAuthError
+    cfg_bad_vertex = AitestConfig()
+    cfg_bad_vertex.llm.vertex = True
+    with pytest.raises(AntigravityAuthError, match="Vertex AI"):
+        validate_sdk_credentials(cfg_bad_vertex)
 
-    cfg = AitestConfig()
-    client = OllamaClient(cfg, transport=httpx.MockTransport(handler), backoff_base_sec=0.0)
-    resp = client.chat(system_prompt="sys", user_prompt="usr")
+    # Hợp lệ với GEMINI_API_KEY
+    cfg_ok = AitestConfig()
+    cfg_ok.llm.api_key = "test-api-key"
+    validate_sdk_credentials(cfg_ok)
 
-    assert attempts["chat"] == 2  # Lần 1 lỗi 500, lần 2 thành công
-    assert "def test_ok():" in resp.content
-    assert resp.model_actual == "qwen2.5-coder:7b"
-    assert resp.model_digest == "sha256:2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730"
-    assert resp.total_tokens == 150
-    assert client.total_calls == 1
-    assert client.total_tokens == 150
-
-
-def test_ollama_client_404_model_not_found_no_retry_ac14() -> None:
-    calls = {"count": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls["count"] += 1
-        return httpx.Response(404, json={"error": "model 'missing:7b' not found"})
-
-    cfg = AitestConfig(model="missing:7b")
-    client = OllamaClient(cfg, transport=httpx.MockTransport(handler), backoff_base_sec=0.0)
-    with pytest.raises(OllamaModelNotFoundError, match="ollama pull missing:7b"):
-        client.chat(system_prompt="sys", user_prompt="usr")
-    assert calls["count"] == 1  # Không retry khi 404
-
-
-def test_ollama_client_structured_assessment_retry_and_log_ac16(tmp_path: Path) -> None:
-    """Kiểm tra AC-16: Lưu raw response vào .aitest_logs/, retry 1 lần khi JSON sai schema, và báo lỗi nếu vẫn sai."""
-    call_idx = {"n": 0}
-    valid_json = json.dumps(
-        {
-            "correctness": 8.5,
-            "readability": 9.0,
-            "maintainability": 8.0,
-            "isolation": 9.0,
-            "robustness": 7.5,
-            "determinism": 9.5,
-            "issues": [
-                {
-                    "title": "Thiếu biên âm",
-                    "description": "Chưa test số âm",
-                    "suggestion": "Thêm test với -1",
-                }
-            ],
-            "summary": "Bộ test tốt.",
-        }
+    spec = SDKCallSpec(
+        system_prompt="You are a QA engineer.",
+        full_prompt="Generate pytest tests.",
+        model=None,
+        api_key=cfg_ok.llm.api_key,
+        vertex=False,
+        project=None,
+        location=None,
+        timeout_sec=120.0,
+        response_schema_model=LLMAssessment,
     )
+    sdk_cfg = build_sdk_agent_config(spec, app_data_dir=str(tmp_path / "sdk_data"))
+    assert sdk_cfg.model is None  # Để SDK tự dùng gemini-3.8-flash khi không ghi đè
+    assert sdk_cfg.capabilities.enable_subagents is False
+    assert sdk_cfg.capabilities.enabled_tools == []
+    assert sdk_cfg.response_schema is not None
+    assert Path(sdk_cfg.app_data_dir).is_absolute()
 
-    def recover_handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/tags":
-            return httpx.Response(200, json={"models": []})
-        call_idx["n"] += 1
-        content = "{invalid json" if call_idx["n"] == 1 else valid_json
-        return httpx.Response(
-            200,
-            json={
-                "model": "qwen2.5-coder:7b",
-                "message": {"role": "assistant", "content": content},
-                "prompt_eval_count": 50,
-                "eval_count": 50,
-            },
+
+def test_antigravity_sdk_client_retry_and_tokens_ac14_ac18() -> None:
+    """Kiểm tra retry lỗi server tạm thời, đọc usage tokens (gồm thinking_tokens) và truy vết model mặc định."""
+    attempts = {"chat": 0}
+    seen_specs: list[SDKCallSpec] = []
+
+    def runner(spec: SDKCallSpec) -> SDKTurnResult:
+        seen_specs.append(spec)
+        attempts["chat"] += 1
+        if attempts["chat"] == 1:
+            raise RuntimeError("503 Temporary backend unavailable")
+        return SDKTurnResult(
+            text="def test_ok():\n    assert 1 == 1\n",
+            model_actual=SDK_DEFAULT_MODEL,
+            conversation_id="conv-sdk-001",
+            prompt_tokens=120,
+            completion_tokens=30,
+            thinking_tokens=15,
+            cache_read_tokens=20,
+            total_tokens=165,
         )
 
     cfg = AitestConfig()
+    cfg.llm.api_key = "test-api-key"
+
+    client = AntigravityClient(cfg, sdk_runner=runner, backoff_base_sec=0.0)
+    resp = client.chat(system_prompt="sys", user_prompt="usr")
+    assert attempts["chat"] == 2
+    assert seen_specs[-1].model is None
+    assert seen_specs[-1].api_key == "test-api-key"
+    assert resp.model_requested == SDK_DEFAULT_MODEL
+    assert resp.model_actual == SDK_DEFAULT_MODEL
+    assert resp.conversation_id == "conv-sdk-001"
+    assert resp.thinking_tokens == 15
+    assert resp.total_tokens == 165
+    assert client.total_calls == 1
+    assert client.total_thinking_tokens == 15
+    assert client.total_tokens == 165
+
+
+def test_antigravity_sdk_client_auth_and_unknown_model_no_retry_ac14() -> None:
+    """Kiểm tra AntigravityModelNotFoundError và AntigravityAuthError dừng ngay không retry."""
+    calls = {"n": 0}
+
+    def unknown_model_runner(spec: SDKCallSpec) -> SDKTurnResult:
+        calls["n"] += 1
+        raise RuntimeError('404 models/missing-model is not found for API version')
+
+    cfg = AitestConfig(model="missing-model")
+    cfg.llm.api_key = "test-api-key"
+    client = AntigravityClient(cfg, sdk_runner=unknown_model_runner, backoff_base_sec=0.0)
+    with pytest.raises(AntigravityModelNotFoundError):
+        client.chat(system_prompt="sys", user_prompt="usr")
+    assert calls["n"] == 1
+
+    calls["n"] = 0
+
+    def auth_err_runner(spec: SDKCallSpec) -> SDKTurnResult:
+        calls["n"] += 1
+        raise RuntimeError("401 API_KEY_INVALID: API key not valid")
+
+    client_auth = AntigravityClient(cfg, sdk_runner=auth_err_runner, backoff_base_sec=0.0)
+    with pytest.raises(AntigravityAuthError, match="GEMINI_API_KEY"):
+        client_auth.chat(system_prompt="sys", user_prompt="usr")
+    assert calls["n"] == 1
+
+
+def test_antigravity_sdk_client_structured_assessment_judge_model_retry_and_log_ac16(tmp_path: Path) -> None:
+    """Kiểm tra AC-16: response_schema=LLMAssessment, judge_model routing, retry 1 lần và lưu raw log."""
+    call_idx = {"n": 0}
+    seen_specs: list[SDKCallSpec] = []
+    valid_obj = {
+        "correctness": 8.5,
+        "readability": 9.0,
+        "maintainability": 8.0,
+        "isolation": 9.0,
+        "robustness": 7.5,
+        "determinism": 9.5,
+        "issues": [
+            {
+                "title": "Thiếu biên âm",
+                "description": "Chưa test số âm",
+                "suggestion": "Thêm test với -1",
+            }
+        ],
+        "summary": "Bộ test tốt.",
+    }
+
+    def recover_runner(spec: SDKCallSpec) -> SDKTurnResult:
+        call_idx["n"] += 1
+        seen_specs.append(spec)
+        assert spec.response_schema_model is LLMAssessment
+        if call_idx["n"] == 1:
+            return SDKTurnResult(
+                text="{invalid json",
+                structured_output=None,
+                model_actual=spec.model or SDK_DEFAULT_MODEL,
+                conversation_id="conv-eval-1",
+            )
+        return SDKTurnResult(
+            text=json.dumps(valid_obj),
+            structured_output=valid_obj,
+            model_actual=spec.model or SDK_DEFAULT_MODEL,
+            conversation_id="conv-eval-1",
+        )
+
+    cfg = AitestConfig()
+    cfg.llm.api_key = "test-api-key"
+    cfg.eval.judge_model = "gemini-3.8-pro"
     log_dir = tmp_path / ".aitest_logs"
-    client = OllamaClient(cfg, transport=httpx.MockTransport(recover_handler), backoff_base_sec=0.0)
-    assessment, _ = client.generate_structured_assessment(
+
+    client = AntigravityClient(cfg, sdk_runner=recover_runner, backoff_base_sec=0.0)
+    assessment, resp = client.generate_structured_assessment(
         system_prompt="sys",
         user_prompt="usr",
         run_id="run-ac16",
         log_dir=log_dir,
     )
     assert assessment.correctness == 8.5
+    assert [s.model for s in seen_specs] == ["gemini-3.8-pro", "gemini-3.8-pro"]
+    assert resp.model_actual == "gemini-3.8-pro"
     assert call_idx["n"] == 2
     assert any(log_dir.glob("*eval_schema_invalid_attempt1.log"))
 
-    # Trường hợp cả 2 lần đều trả JSON sai -> ném OllamaSchemaValidationError, không bịa điểm
-    def always_bad_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "model": "qwen2.5-coder:7b",
-                "message": {"role": "assistant", "content": '{"correctness": 999}'},
-            },
+    def always_bad_runner(spec: SDKCallSpec) -> SDKTurnResult:
+        return SDKTurnResult(
+            text='{"correctness": 999}',
+            structured_output={"correctness": 999},
+            model_actual=spec.model or SDK_DEFAULT_MODEL,
         )
 
-    bad_client = OllamaClient(cfg, transport=httpx.MockTransport(always_bad_handler), backoff_base_sec=0.0)
-    with pytest.raises(OllamaSchemaValidationError):
+    bad_client = AntigravityClient(cfg, sdk_runner=always_bad_runner, backoff_base_sec=0.0)
+    with pytest.raises(AntigravitySchemaValidationError):
         bad_client.generate_structured_assessment(
             system_prompt="sys",
             user_prompt="usr",
@@ -184,33 +236,3 @@ def test_context_and_jinja2_prompts_render_cleanly() -> None:
     )
     assert "surviving mutants" in sys_i
     assert "+ -> -" in usr_i
-
-    run_res = RunResult(
-        target_file="examples/calc.py",
-        test_file="tests/test_calc.py",
-        exit_code=0,
-        all_tests_passed=True,
-        tests_passed=1,
-        pass_rate=1.0,
-        line_coverage_pct=100.0,
-        test_count=1,
-        mutation=MutationResult(
-            mutation_score_pct=80.0,
-            mutation_killed=4,
-            mutation_survived=1,
-            mutation_excluded=0,
-            mutation_status="available",
-            mutation_available=True,
-            survived_mutants=[SurvivedMutant(file="examples/calc.py", line=2, mutation="+ -> -")],
-        ),
-    )
-    sys_e, usr_e = build_eval_prompts(
-        target_file="examples/calc.py",
-        test_file="tests/test_calc.py",
-        source_code=src,
-        test_code="def test_add():\n    assert add(1, 2) == 3\n",
-        run_result=run_res,
-        objective_metrics=run_res.to_objective_metrics(),
-    )
-    assert "Do NOT compute weighted_score" in sys_e
-    assert "mutation_score_pct: 80.0" in usr_e

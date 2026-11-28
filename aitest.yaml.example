@@ -1,8 +1,8 @@
-provider: ollama
-base_url: http://localhost:11434
-model: qwen2.5-coder:7b
+provider: antigravity
+model: null                        # null = dùng mặc định của Google Antigravity SDK (gemini-3.8-flash)
 language: python
 test_framework: pytest
+timeout_sec: 120
 
 coverage:
   enabled: true
@@ -28,7 +28,7 @@ eval:
     determinism: 0.07
   threshold_pass: 8.0
   correctness_cap_offset: 2.0
-  require_mutation_for_comparable_report: true
+  judge_model: null                # để null để dùng chung model, hoặc chỉ định model riêng cho bước đánh giá
 
 fix:
   max_iters: 3
@@ -43,20 +43,19 @@ fix:
 agent:
   max_iters: 3
   max_llm_calls: 12
-  max_total_tokens: 200000
+  max_total_tokens: 400000
   max_runtime_sec: 900
   early_stop_patience: 2
 
 llm:
-  temperature: 0.2
-  max_tokens: 4096                 # map sang Ollama options.num_predict
-  num_ctx: 8192                    # context window
-  keep_alive: 5m
+  vertex: false                    # true để dùng Vertex AI (Standard ADC hoặc Express api_key)
+  project: null                    # GCP project ID khi dùng Vertex Standard ADC
+  location: null                   # GCP region (vd: us-central1) khi dùng Vertex Standard ADC
   timeout_sec: 300
   retry: 2
 
 output:
-  format: json
+  format: json                     # json | md | html
   log_dir: .aitest_logs
   backup_dir: .aitest_backup
 

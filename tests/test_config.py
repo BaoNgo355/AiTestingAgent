@@ -7,16 +7,21 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from aitest.config import AitestConfig, RubricWeights, load_config
+from aitest.config import SDK_DEFAULT_MODEL, AitestConfig, RubricWeights, load_config
 from aitest.utils import compute_config_hash
 
 
 def test_default_config_values_and_rubric_sum() -> None:
-    """Kiểm tra cấu hình mặc định khớp với SRS §10.1."""
+    """Kiểm tra cấu hình mặc định khớp với SRS v4.0.0 §10.1."""
     cfg = AitestConfig()
-    assert cfg.provider == "ollama"
-    assert cfg.base_url == "http://localhost:11434"
-    assert cfg.model == "qwen2.5-coder:7b"
+    assert cfg.provider == "antigravity"
+    assert cfg.model is None
+    assert cfg.effective_model_label == SDK_DEFAULT_MODEL
+    assert cfg.timeout_sec == 120
+    assert cfg.eval.judge_model is None
+    assert cfg.llm.api_key is None
+    assert cfg.llm.vertex is False
+    assert cfg.agent.max_total_tokens == 400000
     assert cfg.mutation.enabled is True
     assert cfg.mutation.tool == "auto"
     assert cfg.eval.threshold_pass == 8.0
@@ -25,31 +30,33 @@ def test_default_config_values_and_rubric_sum() -> None:
 
 
 def test_config_priority_cli_over_env_over_yaml_over_default(tmp_path: Path) -> None:
-    """Kiểm tra thứ tự ưu tiên cấu hình: CLI flags > AITEST_* env > aitest.yaml > defaults."""
+    """Kiểm tra thứ tự ưu tiên cấu hình: CLI flags > AITEST_* / GEMINI_API_KEY > aitest.yaml > defaults."""
     yaml_path = tmp_path / "aitest.yaml"
     yaml_path.write_text(
-        "model: llama3:8b\n"
+        "model: gemini-3.8-pro\n"
         "eval:\n"
         "  threshold_pass: 7.5\n"
+        "  judge_model: gemini-3.8-pro\n"
         "llm:\n"
-        "  temperature: 0.4\n",
+        "  vertex: false\n",
         encoding="utf-8",
     )
     dotenv_path = tmp_path / ".env"
     dotenv_path.write_text(
-        "OLLAMA_BASE_URL=http://10.0.0.5:11434/\n"
-        "OLLAMA_API_KEY=secret-token-999\n",
+        "GEMINI_API_KEY=from-dotenv-secret\n",
         encoding="utf-8",
     )
 
     env = {
-        "OLLAMA_BASE_URL": "http://10.0.0.5:11434/",
-        "OLLAMA_API_KEY": "secret-token-999",
-        "AITEST_LLM__TEMPERATURE": "0.15",
+        "GEMINI_API_KEY": "from-env-secret-key",
+        "AITEST_LLM__VERTEX": "true",
+        "GOOGLE_CLOUD_PROJECT": "demo-gcp-proj",
+        "GOOGLE_CLOUD_LOCATION": "us-central1",
         "AITEST_AGENT__MAX_ITERS": "5",
+        "AITEST_EVAL__JUDGE_MODEL": "null",
     }
     cli_overrides = {
-        "model": "qwen2.5-coder:7b",
+        "model": "gemini-3.8-flash",
     }
 
     cfg = load_config(
@@ -58,18 +65,21 @@ def test_config_priority_cli_over_env_over_yaml_over_default(tmp_path: Path) -> 
         env=env,
         dotenv_path=dotenv_path,
     )
-    assert cfg.model == "qwen2.5-coder:7b"
+    assert cfg.model == "gemini-3.8-flash"
+    assert cfg.effective_model_label == "gemini-3.8-flash"
     assert cfg.eval.threshold_pass == 7.5
-    assert cfg.llm.temperature == 0.15
+    assert cfg.eval.judge_model is None
+    assert cfg.llm.api_key == "from-env-secret-key"
+    assert cfg.llm.vertex is True
+    assert cfg.llm.project == "demo-gcp-proj"
+    assert cfg.llm.location == "us-central1"
     assert cfg.agent.max_iters == 5
-    assert cfg.base_url == "http://10.0.0.5:11434"
-    assert cfg.ollama_api_key is not None
-    assert cfg.ollama_api_key.get_secret_value() == "secret-token-999"
 
-    # Đảm bảo khóa bí mật không bao giờ xuất hiện trong safe_dump hoặc config_hash (NFR-03)
+    # Bảo mật NFR-03: safe_dump() & config_hash không bao giờ chứa api_key
     dumped = cfg.safe_dump()
-    assert "ollama_api_key" not in dumped
-    assert "secret-token-999" not in str(dumped)
+    assert dumped["provider"] == "antigravity"
+    assert "api_key" not in dumped["llm"]
+    assert "from-env-secret-key" not in str(dumped)
     assert compute_config_hash(cfg).startswith("sha256:")
 
 
