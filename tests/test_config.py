@@ -15,7 +15,7 @@ def test_default_config_values_and_rubric_sum() -> None:
     """Kiểm tra cấu hình mặc định khớp với SRS v4.0.0 §10.1."""
     cfg = AitestConfig()
     assert cfg.provider == "antigravity"
-    assert cfg.model is None
+    assert cfg.model == "gemini-4-hydrogen"
     assert cfg.effective_model_label == SDK_DEFAULT_MODEL
     assert cfg.timeout_sec == 120
     assert cfg.eval.judge_model is None
@@ -56,7 +56,7 @@ def test_config_priority_cli_over_env_over_yaml_over_default(tmp_path: Path) -> 
         "AITEST_EVAL__JUDGE_MODEL": "null",
     }
     cli_overrides = {
-        "model": "gemini-3.8-flash",
+        "model": "gemini-4-hydrogen",
     }
 
     cfg = load_config(
@@ -65,8 +65,8 @@ def test_config_priority_cli_over_env_over_yaml_over_default(tmp_path: Path) -> 
         env=env,
         dotenv_path=dotenv_path,
     )
-    assert cfg.model == "gemini-3.8-flash"
-    assert cfg.effective_model_label == "gemini-3.8-flash"
+    assert cfg.model == "gemini-4-hydrogen"
+    assert cfg.effective_model_label == "gemini-4-hydrogen"
     assert cfg.eval.threshold_pass == 7.5
     assert cfg.eval.judge_model is None
     assert cfg.llm.api_key == "from-env-secret-key"

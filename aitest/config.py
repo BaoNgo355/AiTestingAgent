@@ -14,7 +14,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-SDK_DEFAULT_MODEL = "gemini-3.8-flash"
+SDK_DEFAULT_MODEL = "gemini-4-hydrogen"
 OutputFormat = Literal["json", "md", "html"]
 
 
@@ -38,7 +38,7 @@ def normalize_output_format(v: Any) -> OutputFormat:
 
 DEFAULT_AITEST_YAML_TEMPLATE = """\
 provider: antigravity
-model: null                        # null = dùng mặc định của Google Antigravity SDK (gemini-3.8-flash)
+model: gemini-4-hydrogen           # model mặc định trên Google Antigravity SDK
 language: python
 test_framework: pytest
 timeout_sec: 120
@@ -226,7 +226,7 @@ class PathsConfig(BaseModel):
 
 class AitestConfig(BaseModel):
     provider: Literal["antigravity"] = "antigravity"
-    model: str | None = None
+    model: str | None = SDK_DEFAULT_MODEL
     language: Literal["python"] = "python"
     test_framework: Literal["pytest"] = "pytest"
     timeout_sec: int = Field(default=120, ge=1, description="Timeout mặc định cho pytest (FR-03)")
@@ -247,7 +247,7 @@ class AitestConfig(BaseModel):
 
     @property
     def effective_model_label(self) -> str:
-        """Tên model hiển thị và truy vết (trả về mặc định SDK `gemini-3.8-flash` nếu `model` là None)."""
+        """Tên model hiển thị và truy vết (trả về mặc định `gemini-4-hydrogen` nếu `model` là None)."""
         return self.model or SDK_DEFAULT_MODEL
 
     def safe_dump(self) -> dict[str, Any]:

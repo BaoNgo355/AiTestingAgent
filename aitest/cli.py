@@ -106,7 +106,7 @@ def init_cmd(
     env_example_content = (
         "# Khóa API cho Google Antigravity SDK (tạo tại https://aistudio.google.com/app/api-keys)\n"
         "GEMINI_API_KEY=your_gemini_api_key_here\n"
-        "# AITEST_MODEL=gemini-3.8-flash\n"
+        "# AITEST_MODEL=gemini-4-hydrogen\n"
     )
     if env_example_path.exists() and not force:
         skipped_files.append(".env.example (đã tồn tại)")
@@ -209,7 +209,7 @@ def gen_cmd(
     model: Optional[str] = typer.Option(
         None,
         "--model",
-        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-3.8-flash).",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-4-hydrogen).",
     ),
     quiet: bool = typer.Option(
         False,
@@ -325,7 +325,7 @@ def fix_cmd(
     model: Optional[str] = typer.Option(
         None,
         "--model",
-        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-3.8-flash).",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-4-hydrogen).",
     ),
     quiet: bool = typer.Option(
         False,
@@ -389,7 +389,7 @@ def eval_cmd(
     model: Optional[str] = typer.Option(
         None,
         "--model",
-        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-3.8-flash).",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-4-hydrogen).",
     ),
     judge_model: Optional[str] = typer.Option(
         None,
@@ -489,7 +489,7 @@ def agent_cmd(
     model: Optional[str] = typer.Option(
         None,
         "--model",
-        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-3.8-flash).",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định: gemini-4-hydrogen).",
     ),
     judge_model: Optional[str] = typer.Option(
         None,

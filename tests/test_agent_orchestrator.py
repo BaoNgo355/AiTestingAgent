@@ -219,7 +219,7 @@ def test_experiment_summary_and_markdown_report(tmp_path: Path) -> None:
             "meta": {
                 "generated_at": "2026-11-28T12:00:00Z",
                 "provider": "antigravity",
-                "model": "gemini-3.8-flash",
+                "model": "gemini-4-hydrogen",
                 "judge_model": None,
                 "vertex": False,
                 "runs_per_file": 1,

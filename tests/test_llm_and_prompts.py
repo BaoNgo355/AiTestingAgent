@@ -49,7 +49,7 @@ def test_build_sdk_agent_config_isolation_and_credential_validation(tmp_path: Pa
     spec = SDKCallSpec(
         system_prompt="You are a QA engineer.",
         full_prompt="Generate pytest tests.",
-        model=None,
+        model=SDK_DEFAULT_MODEL,
         api_key=cfg_ok.llm.api_key,
         vertex=False,
         project=None,
@@ -58,7 +58,7 @@ def test_build_sdk_agent_config_isolation_and_credential_validation(tmp_path: Pa
         response_schema_model=LLMAssessment,
     )
     sdk_cfg = build_sdk_agent_config(spec, app_data_dir=str(tmp_path / "sdk_data"))
-    assert sdk_cfg.model is None  # Để SDK tự dùng gemini-3.8-flash khi không ghi đè
+    assert sdk_cfg.model == "gemini-4-hydrogen"
     assert sdk_cfg.capabilities.enable_subagents is False
     assert sdk_cfg.capabilities.enabled_tools == []
     assert sdk_cfg.response_schema is not None
@@ -92,7 +92,7 @@ def test_antigravity_sdk_client_retry_and_tokens_ac14_ac18() -> None:
     client = AntigravityClient(cfg, sdk_runner=runner, backoff_base_sec=0.0)
     resp = client.chat(system_prompt="sys", user_prompt="usr")
     assert attempts["chat"] == 2
-    assert seen_specs[-1].model is None
+    assert seen_specs[-1].model == SDK_DEFAULT_MODEL
     assert seen_specs[-1].api_key == "test-api-key"
     assert resp.model_requested == SDK_DEFAULT_MODEL
     assert resp.model_actual == SDK_DEFAULT_MODEL

@@ -84,7 +84,7 @@ def test_rich_progress_reporter_quiet_and_verbose_modes() -> None:
     q_rep.warn("warn")
     q_rep.on_llm_call_end(
         task_name="gen",
-        model="gemini-3.8-flash",
+        model="gemini-4-hydrogen",
         prompt_tokens=100,
         completion_tokens=50,
         thinking_tokens=10,
@@ -103,7 +103,7 @@ def test_rich_progress_reporter_quiet_and_verbose_modes() -> None:
     )
     v_rep.on_llm_call_end(
         task_name="gen",
-        model="gemini-3.8-flash",
+        model="gemini-4-hydrogen",
         prompt_tokens=100,
         completion_tokens=50,
         thinking_tokens=10,

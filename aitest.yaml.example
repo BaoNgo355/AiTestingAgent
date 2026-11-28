@@ -1,5 +1,5 @@
 provider: antigravity
-model: null                        # null = dùng mặc định của Google Antigravity SDK (gemini-3.8-flash)
+model: gemini-4-hydrogen           # model mặc định trên Google Antigravity SDK
 language: python
 test_framework: pytest
 timeout_sec: 120

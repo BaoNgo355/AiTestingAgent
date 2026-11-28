@@ -237,7 +237,7 @@ def test_cli_init_and_single_file_constraint_ac01_ac02(tmp_path: Path, monkeypat
     # Chạy `aitest init --force` -> ghi đè về mặc định v4.0.0
     r3 = runner.invoke(app, ["init", "--force"])
     assert r3.exit_code == 0
-    assert "gemini-3.8-flash" in yaml_file.read_text(encoding="utf-8")
+    assert "gemini-4-hydrogen" in yaml_file.read_text(encoding="utf-8")
 
     # AC-02: Truyền thư mục vào `aitest gen` -> báo lỗi rõ ràng, exit_code != 0
     r_dir = runner.invoke(app, ["gen", str(tmp_path)])

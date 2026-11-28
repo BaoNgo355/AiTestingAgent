@@ -484,7 +484,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default=None,
-        help="Ghi đè model ID của Google Antigravity SDK (mặc định dùng gemini-3.8-flash).",
+        help="Ghi đè model ID của Google Antigravity SDK (mặc định dùng gemini-4-hydrogen).",
     )
     parser.add_argument(
         "--judge-model",

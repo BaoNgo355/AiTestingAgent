@@ -47,12 +47,12 @@ def test_config_priority_and_env_override(tmp_path: Path) -> None:
         "AITEST_EVAL__THRESHOLD_PASS": "8.5",
     }
     cli_overrides = {
-        "model": "gemini-3.8-flash",
+        "model": "gemini-4-hydrogen",
     }
 
     cfg = load_config(config_path=yaml_file, cli_overrides=cli_overrides, env=env)
     assert cfg.provider == "antigravity"
-    assert cfg.model == "gemini-3.8-flash"  # từ CLI
+    assert cfg.model == "gemini-4-hydrogen"  # từ CLI
     assert cfg.llm.vertex is True  # từ AITEST_LLM__VERTEX
     assert cfg.llm.api_key == "secret-key-abc"  # từ GEMINI_API_KEY
     assert cfg.llm.project == "proj-env"
@@ -79,10 +79,10 @@ def test_eval_report_reference_example_ac19() -> None:
         generated_at="2026-11-28T14:00:00Z",
         target_file="examples/calculator.py",
         test_file="tests/test_calculator.py",
-        model_requested="gemini-3.8-flash",
-        model_actual="gemini-3.8-flash",
-        judge_model_requested="gemini-3.8-flash",
-        judge_model_actual="gemini-3.8-flash",
+        model_requested="gemini-4-hydrogen",
+        model_actual="gemini-4-hydrogen",
+        judge_model_requested="gemini-4-hydrogen",
+        judge_model_actual="gemini-4-hydrogen",
         conversation_id="conv-ac19",
         config_hash="sha256:8f9d2a1b3c4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a",
         run_id="550e8400-e29b-41d4-a716-446655440000",
@@ -182,7 +182,7 @@ def test_correctness_cap_and_no_valid_mutants_ac11_ac20_ac21_ac22_ac23() -> None
         generated_at="2026-11-28T14:00:00Z",
         target_file="examples/empty.py",
         test_file="tests/test_empty.py",
-        model_requested="gemini-3.8-flash",
+        model_requested="gemini-4-hydrogen",
         config_hash="sha256:abc",
         run_id="run-123",
     )

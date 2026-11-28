@@ -28,7 +28,7 @@ Hệ thống kết hợp phân tích tĩnh (AST), đo lường khách quan (`pyt
 
 - **Phân tích mã nguồn bằng AST**: Trích xuất hàm, lớp, phương thức, chữ ký, chú thích kiểu và điều kiện ngoại lệ (`if ...: raise ...`) từ file Python đơn lẻ (`*.py`).
 - **Tích hợp Google Antigravity Python SDK (`google-antigravity`)**:
-  - Sử dụng trực tiếp `Agent` + `LocalAgentConfig` của SDK (mặc định `gemini-3.8-flash`), hỗ trợ cả `GEMINI_API_KEY` (Google AI Studio) lẫn **Vertex AI**.
+  - Sử dụng trực tiếp `Agent` + `LocalAgentConfig` của SDK (mặc định `gemini-4-hydrogen`), hỗ trợ cả `GEMINI_API_KEY` (Google AI Studio) lẫn **Vertex AI**.
   - Cô lập quyền an toàn bằng `policy.deny_all()`, tắt toàn bộ built-in tools/subagents và trỏ `app_data_dir` vào thư mục tạm riêng để bảo đảm chỉ `aitest` điều phối file test; bước `eval` ép đầu ra chuẩn Pydantic `LLMAssessment` qua `response_schema`.
   - Hỗ trợ tùy chọn `--model` và `--judge-model` (tách model chấm điểm riêng).
 - **Sinh Unit Test an toàn (Safe Append)**: Hỗ trợ chế độ `append` (mặc định, tự động dedup bằng AST cho cả hàm `test_*` và lớp `Test*`) hoặc `overwrite`.
@@ -63,7 +63,7 @@ Cải thiện (improve) <- Đánh giá (eval) <- Sửa lỗi (fix) / Mutation
 - **Python**: `>= 3.10`
 - **Google Antigravity SDK (`google-antigravity>=0.1.24`)**: tự động cài khi chạy `pip install -e .`
 - **Xác thực**: biến môi trường hoặc `.env` chứa `GEMINI_API_KEY` (tạo tại Google AI Studio) hoặc cấu hình Vertex AI
-- **Model mặc định**: SDK tự dùng `gemini-3.8-flash` khi `model: null` (có thể ghi đè qua `--model` / `--judge-model`)
+- **Model mặc định**: `gemini-4-hydrogen` (có thể ghi đè qua `--model` / `--judge-model`)
 
 ---
 
@@ -132,7 +132,7 @@ aitest init [--force]
 
 ```bash
 aitest gen examples/calculator.py
-aitest gen examples/calculator.py --mode overwrite --model gemini-3.8-flash
+aitest gen examples/calculator.py --mode overwrite --model gemini-4-hydrogen
 ```
 
 Các tùy chọn chính:
@@ -208,9 +208,9 @@ Tham khảo [`aitest.yaml.example`](aitest.yaml.example) và [`.env.example`](.e
 - **Biến môi trường (`.env`)**:
   ```env
   GEMINI_API_KEY=your_gemini_api_key_here
-  # AITEST_MODEL=gemini-3.8-flash
+  # AITEST_MODEL=gemini-4-hydrogen
   ```
-- **File `aitest.yaml`**: Cho phép tùy chỉnh `model` (`null` = mặc định `gemini-3.8-flash`), `timeout_sec`, `coverage`, `mutation`, trọng số `eval.rubric`, `eval.judge_model`, ngưỡng `threshold_pass`, quy tắc `fix.quality_guard`, ngân sách `agent` và tham số `llm` (`vertex`, `project`, `location`, `timeout_sec`, `retry`).
+- **File `aitest.yaml`**: Cho phép tùy chỉnh `model` (mặc định `gemini-4-hydrogen`), `timeout_sec`, `coverage`, `mutation`, trọng số `eval.rubric`, `eval.judge_model`, ngưỡng `threshold_pass`, quy tắc `fix.quality_guard`, ngân sách `agent` và tham số `llm` (`vertex`, `project`, `location`, `timeout_sec`, `retry`).
 
 ---
 
