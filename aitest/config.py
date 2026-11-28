@@ -355,16 +355,34 @@ def load_config(
     """Tải và hợp nhất cấu hình theo đúng thứ tự ưu tiên SRS v4.0.0 §10.3:
     CLI flags > Biến môi trường AITEST_* / GEMINI_API_KEY > aitest.yaml > Defaults.
     """
+    from aitest.utils import discover_project_root
+
+    project_root = discover_project_root()
     yaml_data: dict[str, Any] = {}
-    resolved_config_path = Path(config_path) if config_path else Path("aitest.yaml")
+    if config_path is not None:
+        resolved_config_path = Path(config_path)
+    else:
+        cwd_yaml = Path("aitest.yaml")
+        resolved_config_path = cwd_yaml if cwd_yaml.is_file() else (project_root / "aitest.yaml")
+
     if resolved_config_path.is_file():
         loaded = yaml.safe_load(resolved_config_path.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
             yaml_data = loaded
 
-    # Hợp nhất .env và os.environ (os.environ ưu tiên cao hơn .env)
-    resolved_dotenv = Path(dotenv_path) if dotenv_path else Path(".env")
-    dotenv_vars = _parse_dotenv_file(resolved_dotenv) if env is None else {}
+    # Hợp nhất .env (tự dò từ CWD hoặc thư mục gốc dự án) và os.environ (os.environ ưu tiên cao hơn .env)
+    dotenv_vars: dict[str, str] = {}
+    if env is None:
+        if dotenv_path is not None:
+            dotenv_vars = _parse_dotenv_file(Path(dotenv_path))
+        else:
+            root_env = project_root / ".env"
+            cwd_env = Path(".env")
+            if root_env.is_file():
+                dotenv_vars.update(_parse_dotenv_file(root_env))
+            if cwd_env.is_file() and cwd_env.resolve() != root_env.resolve():
+                dotenv_vars.update(_parse_dotenv_file(cwd_env))
+
     effective_env: dict[str, str] = {**dotenv_vars, **(env if env is not None else dict(os.environ))}
 
     env_overrides = _extract_env_overrides(effective_env)
